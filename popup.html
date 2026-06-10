@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <h1>Upwork → GitHub Harvester</h1>
+
+  <details id="cfg" open>
+    <summary>Settings</summary>
+    <label>Search URL (start page taken from its <code>page=</code> param)</label>
+    <textarea id="searchUrl" rows="3" placeholder="https://www.upwork.com/nx/search/talent/?q=full%20stack%20developer&...&page=20"></textarea>
+
+    <label>GitHub Personal Access Token</label>
+    <input id="githubToken" type="password" placeholder="ghp_… (read:user, user:email)">
+
+    <label>POST endpoint (Apps Script /exec)</label>
+    <input id="postEndpoint" type="text">
+
+    <div class="row">
+      <div><label>Min delay (ms)</label><input id="minDelayMs" type="number" min="0"></div>
+      <div><label>Max delay (ms)</label><input id="maxDelayMs" type="number" min="0"></div>
+    </div>
+    <button id="save" class="secondary">Save settings</button>
+  </details>
+
+  <div class="controls">
+    <button id="start">Start</button>
+    <button id="pause" class="secondary">Pause</button>
+    <button id="resume" class="secondary">Resume</button>
+    <button id="stop" class="danger">Stop</button>
+  </div>
+
+  <div id="status" class="status">idle</div>
+  <div id="counters" class="counters"></div>
+
+  <div class="log-head">
+    <span>Log</span>
+    <button id="clear" class="link">clear</button>
+  </div>
+  <div id="log" class="log"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

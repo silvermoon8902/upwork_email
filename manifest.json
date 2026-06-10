@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Upwork → GitHub Email Harvester",
+  "version": "0.1.0",
+  "description": "Walks an Upwork talent search, resolves each candidate's GitHub linked account to an email, and posts results to a Google Sheet sink.",
+  "permissions": ["storage", "tabs", "scripting", "alarms"],
+  "host_permissions": [
+    "https://www.upwork.com/*",
+    "https://api.github.com/*",
+    "https://script.google.com/*",
+    "https://script.googleusercontent.com/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Upwork → GitHub Harvester"
+  }
+}

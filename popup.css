@@ -1,0 +1,45 @@
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, system-ui, sans-serif;
+  width: 380px; margin: 0; padding: 12px;
+  color: #1d1d1f; background: #fff; font-size: 13px;
+}
+h1 { font-size: 14px; margin: 0 0 10px; }
+label { display: block; font-weight: 600; margin: 8px 0 3px; font-size: 12px; }
+code { background: #f1f1f1; padding: 0 3px; border-radius: 3px; }
+input, textarea {
+  width: 100%; padding: 6px; border: 1px solid #ccc; border-radius: 6px;
+  font-size: 12px; font-family: inherit;
+}
+textarea { resize: vertical; }
+.row { display: flex; gap: 8px; }
+.row > div { flex: 1; }
+details { border: 1px solid #eee; border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+summary { font-weight: 700; cursor: pointer; }
+.controls { display: flex; gap: 6px; margin: 10px 0; }
+button {
+  flex: 1; padding: 8px; border: 0; border-radius: 6px; cursor: pointer;
+  background: #14a800; color: #fff; font-weight: 600; font-size: 12px;
+}
+button.secondary { background: #e7f5e7; color: #0a6b00; }
+button.danger { background: #fbe9e9; color: #c0392b; }
+button.link { flex: 0; background: none; color: #14a800; padding: 0; font-size: 11px; }
+#save { width: 100%; margin-top: 8px; }
+.status {
+  padding: 6px 8px; border-radius: 6px; background: #f5f5f5;
+  font-weight: 600; text-align: center;
+}
+.status.running { background: #e7f5e7; color: #0a6b00; }
+.status.paused  { background: #fff4e0; color: #a76b00; }
+.status.captcha { background: #fbe9e9; color: #c0392b; }
+.counters { font-size: 11px; color: #666; margin: 6px 0; text-align: center; }
+.log-head { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-weight: 700; }
+.log {
+  height: 200px; overflow-y: auto; border: 1px solid #eee; border-radius: 6px;
+  padding: 6px; font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.5;
+  background: #fafafa;
+}
+.log .ok    { color: #0a6b00; }
+.log .warn  { color: #a76b00; }
+.log .error { color: #c0392b; }
+.log .t { color: #999; margin-right: 4px; }
