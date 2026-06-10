@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//sdb-disk/**)",
+      "Bash(node --check background.js)"
+    ]
+  }
+}

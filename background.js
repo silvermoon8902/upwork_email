@@ -33,8 +33,8 @@ let S = {
   page: 1,
   queue: [],               // [{ id, name, profileUrl }]
   queueIndex: 0,
-  searchTabId: null,
-  pendingTabId: null,      // profile tab left open for captcha solving
+  searchTabId: null,       // reused background tab for search pages
+  profileTabId: null,      // current profile tab (kept open across a captcha pause)
   processed: 0,
   emails: 0,
   current: ''
@@ -283,12 +283,25 @@ async function postToSink(endpoint, payload) {
 
 /* ------------------------------ orchestration --------------------------- */
 
+// Dolphin Anty rejects creating a *foreground* tab from a cold service worker
+// ("Onboarding tab should not be opened at startup"). Workana's working pattern:
+// create the tab in the background, then activate it separately. We do the same.
+async function createProfileTab(url) {
+  const tab = await chrome.tabs.create({ url, active: false });
+  try { await chrome.tabs.update(tab.id, { active: true }); } catch {}  // bring forward to watch
+  return tab.id;
+}
+
+// Search pages don't need watching — keep that tab in the background and reuse it.
 async function ensureSearchTab(url) {
   if (S.searchTabId != null) {
-    try { await chrome.tabs.get(S.searchTabId); await chrome.tabs.update(S.searchTabId, { url, active: true }); return S.searchTabId; }
-    catch { S.searchTabId = null; }
+    try {
+      await chrome.tabs.get(S.searchTabId);
+      await chrome.tabs.update(S.searchTabId, { url });
+      return S.searchTabId;
+    } catch { S.searchTabId = null; }
   }
-  const tab = await chrome.tabs.create({ url, active: true });
+  const tab = await chrome.tabs.create({ url, active: false });
   S.searchTabId = tab.id;
   return tab.id;
 }
@@ -316,10 +329,9 @@ async function scrapeProfileWithRetry(tabId) {
   return await runInTab(tabId, scrapeProfile);
 }
 
-function captchaPause(tabId) {
+function captchaPause() {
   S.status = 'paused';
   S.captcha = true;
-  S.pendingTabId = tabId != null ? tabId : null;
   setBadge(true);
 }
 
@@ -327,77 +339,80 @@ async function processCandidate(cfg, cand) {
   S.current = cand.name || cand.id;
   await pushLog(`▶ ${cand.name || cand.id} — opening profile…`);
 
-  let tabId = S.pendingTabId;
+  // Reuse a tab left open for captcha solving; otherwise open a fresh one.
+  let tabId = S.profileTabId;
   if (tabId != null) {
-    S.pendingTabId = null;
-    try { await chrome.tabs.update(tabId, { active: true }); await waitForLoad(tabId, 8000); }
+    S.profileTabId = null;
+    try { await chrome.tabs.get(tabId); await waitForLoad(tabId, 8000); }
     catch { tabId = null; }
   }
   if (tabId == null) {
-    const tab = await chrome.tabs.create({ url: cand.profileUrl, active: true });
-    tabId = tab.id;
+    tabId = await createProfileTab(cand.profileUrl);
     await waitForLoad(tabId);
     await sleep(3000);
   }
 
-  const data = await scrapeProfileWithRetry(tabId);
-  if (data && data.blocked) {
-    await pushLog('⚠️ CAPTCHA on profile — solve it in the open tab, then click Resume.', 'warn');
-    captchaPause(tabId);
-    return;
-  }
-
-  const name = (data && data.name) || cand.name || '';
-  if (!data || !data.github || !data.github.numericId) {
-    await pushLog(`— ${name || cand.id}: no GitHub linked account.`);
-    await closeTab(tabId);
-    return;
-  }
-
-  let gh;
+  let keepOpen = false;
   try {
-    gh = await resolveGithub(data.github.numericId, cfg.githubToken);
-  } catch (e) {
-    if (String(e).includes('rate-limited')) {
-      await pushLog('⚠️ GitHub rate limit hit — pausing. Add/refresh a PAT, then Resume.', 'warn');
-      S.status = 'paused'; setBadge(false); S.pendingTabId = tabId; return;
+    const data = await scrapeProfileWithRetry(tabId);
+    if (data && data.blocked) {
+      await pushLog('⚠️ CAPTCHA on profile — solve it in the open tab, then click Resume.', 'warn');
+      keepOpen = true; S.profileTabId = tabId; captchaPause();
+      return;
     }
-    await pushLog(`GitHub resolve failed for ${name}: ${e}`, 'error');
-    await closeTab(tabId);
-    return;
-  }
 
-  const githubLink = gh.html_url || ('https://github.com/' + gh.login);
-  let email = (gh.email && !isNoreply(gh.email)) ? gh.email : '';
-  if (!email) {
-    try { email = await findCommitEmail(gh.login, cfg.githubToken); }
-    catch (e) {
+    const name = (data && data.name) || cand.name || '';
+    if (!data || !data.github || !data.github.numericId) {
+      await pushLog(`— ${name || cand.id}: no GitHub linked account.`);
+      return;
+    }
+
+    let gh;
+    try {
+      gh = await resolveGithub(data.github.numericId, cfg.githubToken);
+    } catch (e) {
       if (String(e).includes('rate-limited')) {
         await pushLog('⚠️ GitHub rate limit hit — pausing. Add/refresh a PAT, then Resume.', 'warn');
-        S.status = 'paused'; setBadge(false); S.pendingTabId = tabId; return;
+        keepOpen = true; S.profileTabId = tabId; S.status = 'paused'; setBadge(false);
+        return;
+      }
+      await pushLog(`GitHub resolve failed for ${name}: ${e}`, 'error');
+      return;
+    }
+
+    const githubLink = gh.html_url || ('https://github.com/' + gh.login);
+    let email = (gh.email && !isNoreply(gh.email)) ? gh.email : '';
+    if (!email) {
+      try { email = await findCommitEmail(gh.login, cfg.githubToken); }
+      catch (e) {
+        if (String(e).includes('rate-limited')) {
+          await pushLog('⚠️ GitHub rate limit hit — pausing. Add/refresh a PAT, then Resume.', 'warn');
+          keepOpen = true; S.profileTabId = tabId; S.status = 'paused'; setBadge(false);
+          return;
+        }
       }
     }
-  }
 
-  if (email && !isNoreply(email)) {
-    const payload = {
-      upwork_name: name,
-      upwork_profile_link: cand.profileUrl,
-      github_profile_link: githubLink,
-      email_address: email,
-      job_success_score: (data && data.jss) || '',
-      badge: (data && data.badge) || '',
-      hourly_rate: (data && data.hourlyRate) || '',
-      total_earning: (data && data.earning) || ''
-    };
-    const ok = await postToSink(cfg.postEndpoint, payload);
-    S.emails++;
-    await pushLog(`✅ ${name} → ${email}  (${githubLink})${ok ? '' : '  [POST failed]'}`, 'ok');
-  } else {
-    await pushLog(`— ${name} (${gh.login}): no public/commit email found.`);
+    if (email && !isNoreply(email)) {
+      const payload = {
+        upwork_name: name,
+        upwork_profile_link: cand.profileUrl,
+        github_profile_link: githubLink,
+        email_address: email,
+        job_success_score: (data && data.jss) || '',
+        badge: (data && data.badge) || '',
+        hourly_rate: (data && data.hourlyRate) || '',
+        total_earning: (data && data.earning) || ''
+      };
+      const ok = await postToSink(cfg.postEndpoint, payload);
+      S.emails++;
+      await pushLog(`✅ ${name} → ${email}  (${githubLink})${ok ? '' : '  [POST failed]'}`, 'ok');
+    } else {
+      await pushLog(`— ${name} (${gh.login}): no public/commit email found.`);
+    }
+  } finally {
+    if (!keepOpen) await closeTab(tabId);
   }
-
-  await closeTab(tabId);
 }
 
 async function drive() {
@@ -412,7 +427,7 @@ async function drive() {
         if (S.status !== 'running') break;
         if (res.blocked) {
           await pushLog('⚠️ CAPTCHA on search page — solve it, then click Resume.', 'warn');
-          captchaPause(S.searchTabId);
+          captchaPause();
           break;
         }
         if (res.candidates.length === 0) {
@@ -450,7 +465,7 @@ async function cmdStart() {
     status: 'running', captcha: false,
     page: parsePage(cfg.searchUrl),
     queue: [], queueIndex: 0,
-    searchTabId: null, pendingTabId: null,
+    searchTabId: null, profileTabId: null,
     processed: 0, emails: 0, current: ''
   };
   await pushLog(`Start — search from page ${S.page}.`, 'ok');
