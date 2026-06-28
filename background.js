@@ -18,6 +18,9 @@
 
 const STORE = { config: 'hv_config', state: 'hv_state', log: 'hv_log' };
 
+// Candidates located in these countries are skipped (lowercased match on country-name).
+const SKIP_COUNTRIES = ['india', 'pakistan'];
+
 const DEFAULT_CONFIG = {
   searchUrl: '',
   githubToken: '',
@@ -134,6 +137,10 @@ async function closeTab(tabId) {
   try { await chrome.tabs.remove(tabId); } catch {}
 }
 
+async function humanScroll(tabId) {
+  try { await chrome.scripting.executeScript({ target: { tabId }, func: humanScrollFn }); } catch {}
+}
+
 /* ------------------------- injected page scrapers ----------------------- */
 /* These run in the page context (serialized by executeScript) — keep them
  * fully self-contained, no references to outer scope. */
@@ -189,6 +196,10 @@ function scrapeProfile() {
   const em = txt.match(/\$\s?[\d,.]+\s*[KMB]?\+?\s*(?:total\s+)?earn/i);
   if (em) { const mm = em[0].match(/\$\s?[\d,.]+\s*[KMB]?\+?/); if (mm) earning = mm[0].replace(/\s+/g, ''); }
 
+  let country = '';
+  const cEl = document.querySelector('[itemprop="country-name"]');
+  if (cEl) country = cEl.textContent.replace(/\s+/g, ' ').trim();
+
   let github = null;
   const linked = document.querySelector('[data-qa="linked-accounts"]') || document;
   const titleEls = linked.querySelectorAll('.title, span');
@@ -203,7 +214,17 @@ function scrapeProfile() {
     break;
   }
 
-  return { blocked: false, name, hourlyRate, jss, badge, earning, github, url: location.href };
+  return { blocked: false, name, country, hourlyRate, jss, badge, earning, github, url: location.href };
+}
+
+// Injected: scroll the page down then back up to mimic a real user before scraping.
+async function humanScrollFn() {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const steps = 6;
+  const h = () => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+  for (let i = 1; i <= steps; i++) { window.scrollTo(0, (h() / steps) * i); await sleep(220 + Math.random() * 380); }
+  await sleep(400);
+  for (let i = steps; i >= 0; i--) { window.scrollTo(0, (h() / steps) * i); await sleep(180 + Math.random() * 260); }
 }
 
 /* ------------------------------ GitHub API ------------------------------ */
@@ -352,6 +373,8 @@ async function processCandidate(cfg, cand) {
     await sleep(3000);
   }
 
+  await humanScroll(tabId);  // look like a real visitor before scraping
+
   let keepOpen = false;
   try {
     const data = await scrapeProfileWithRetry(tabId);
@@ -362,6 +385,12 @@ async function processCandidate(cfg, cand) {
     }
 
     const name = (data && data.name) || cand.name || '';
+    const country = (data && data.country) || '';
+    if (country && SKIP_COUNTRIES.indexOf(country.toLowerCase()) !== -1) {
+      await pushLog(`⏭ ${name || cand.id}: ${country} — skipped.`);
+      return;
+    }
+
     if (!data || !data.github || !data.github.numericId) {
       await pushLog(`— ${name || cand.id}: no GitHub linked account.`);
       return;
