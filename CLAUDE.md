@@ -33,7 +33,8 @@ The service worker is an ES module (`"type": "module"` in the manifest), so `bac
 imports the resolver modules directly. Three isolated contexts, no shared bundling:
 
 - **`background.js`** — orchestrator: run state machine, tab choreography, page scrapers, sink POST.
-  - **`contactout.js`** — ContactOut search + email reveal.
+  - **`contactout_ui.js`** — ContactOut search + email reveal, **driven through the dashboard UI
+    in a tab** (the API is a paid tier the account doesn't have).
   - **`matcher.js`** — identity matching (school overlap, then OpenAI).
   - **`errors.js`** — `PauseRun`, the error class meaning "stop the sweep, don't skip one candidate".
   - **`imghash.js`** — perceptual hashing. **Currently unused**; not imported by anything.
@@ -95,6 +96,46 @@ else depends on Upwork's DOM.
 `scrapeProfileWithRetry` requires `name` **and** at least one of education/skills before
 accepting a scrape. Keying only on `name` returns on first paint and never gives the
 late-rendering sections a chance.
+
+### Driving the ContactOut dashboard
+
+There is no API token — `coSearchViaTab` fills the real search form in a reused background
+tab (`S.coTabId`), which the user must be logged into. Three things there are load-bearing:
+
+- **React ignores `el.value = x`.** `fillSearchFormFn` writes through
+  `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set` and then dispatches
+  `input`, or the value is reverted on the next render.
+- **Never anchor on react-select's generated ids.** `react-select-17-input` shifts whenever the
+  form's field count changes (collapsing an "Advanced" section is enough). Every field is found
+  by its `<label>` text instead. Name is the one exception — `input[name="nm"]` is stable.
+- **react-select commits on `mousedown`, not `click`,** and its menu loads async, so `pick()`
+  types, polls for `.contactout-select__option`, then fires mousedown/mouseup/click.
+
+Each search reloads the tab *and* clicks "Clear all" — School/Degree is a multi-select, so
+without the reset every candidate inherits the previous one's schools.
+
+Result cards carry hashed emotion classes (`css-9w0zfn`, `css-1o52pgu`) that rotate on every
+ContactOut deploy — **never select on those**. `scrapeResultsFn` anchors on stable handles:
+
+- `a[data-testid="linkedin-link"]` is the card's identity; the card itself is found by walking
+  up until an ancestor also contains `button.reveal-btn`. The sibling `github.com/search?q=…`
+  and `twitter.com/search?q=…` anchors are *search* links, not profiles — never treat them as one.
+- The name `<span>` is `linkedinAnchor.parentElement.previousElementSibling`.
+- **Experience and education rows are the same markup**; only the leading icon differs.
+  `viewBox="0 0 12 12"` is the briefcase (experience), `"0 0 12 10"` the graduation cap
+  (education). That viewBox check is the only thing separating them — ContactOut returns
+  duplicate rows, so both lists dedupe.
+- Emails are masked (`***@hotmail.com`) until `button.reveal-btn` is clicked, which spends a
+  credit. "View phone" shares that class, so the reveal button is matched on its *label*.
+  `[data-testid="confidence-level-indicator"][data-tip="Verified"]` is a per-address quality flag.
+- The header reads "1 - 15 of 70 profiles"; the page caps at 15, so `total` is logged whenever
+  it exceeds what was read — a common first name silently truncating is worth seeing.
+
+`winner.hasEmail` is checked **after** matching, not before. Filtering email-less cards out of
+the pool first would let a confident match land on the wrong person instead of reporting a dead end.
+
+If the card layout changes, `scrapeResultsFn` returns `debugSample` (a slice of the results
+markup) which is logged to the SW console — use that rather than guessing at new selectors.
 
 ### Identity matching
 

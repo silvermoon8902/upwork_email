@@ -18,9 +18,12 @@
  * Start / Pause / Resume. Captcha auto-pauses (solve in the tab, then Resume).
  * ==========================================================================*/
 
-import { coSearch, coEmail } from './contactout.js';
+import {
+  CO_SEARCH_URL, fillSearchFormFn, scrapeResultsFn, revealEmailFn,
+  normalize, filterByLastInitial
+} from './contactout_ui.js';
 import { deterministicMatch, aiMatch } from './matcher.js';
-import { shouldPause } from './errors.js';
+import { PauseRun, shouldPause } from './errors.js';
 
 const STORE = { config: 'hv_config', state: 'hv_state', log: 'hv_log' };
 
@@ -29,7 +32,6 @@ const SKIP_COUNTRIES = ['india', 'pakistan'];
 
 const DEFAULT_CONFIG = {
   searchUrl: '',
-  contactOutToken: '',
   openaiKey: '',
   openaiModel: 'gpt-4o',
   postEndpoint: 'https://script.google.com/macros/s/AKfycbwG_SXJPo_dn0FJQchDxGJOgYtNqgnsk98drSgRJfxhz3BS3RgjVcY-g2b3OyonhqwecQ/exec',
@@ -49,6 +51,7 @@ let S = {
   queueIndex: 0,
   searchTabId: null,       // reused background tab for search pages
   profileTabId: null,      // current profile tab (kept open across a captcha pause)
+  coTabId: null,           // reused background tab holding the ContactOut dashboard
   processed: 0,
   emails: 0,
   current: ''
@@ -152,8 +155,10 @@ async function waitForLoad(tabId, timeout = 25000) {
   });
 }
 
-async function runInTab(tabId, func) {
-  const [res] = await chrome.scripting.executeScript({ target: { tabId }, func });
+async function runInTab(tabId, func, args) {
+  const opts = { target: { tabId }, func };
+  if (args !== undefined) opts.args = [args];   // must be JSON-serializable
+  const [res] = await chrome.scripting.executeScript(opts);
   return res ? res.result : null;
 }
 
@@ -329,6 +334,69 @@ async function ensureSearchTab(url) {
   return tab.id;
 }
 
+/* ---------------------------- ContactOut tab ---------------------------- */
+/* The API is a paid tier, so the dashboard is driven in a real logged-in tab.
+ * One tab is reused for the whole run; each search reloads it so the React form
+ * starts from a clean state (the in-page "Clear all" is clicked as well). */
+
+async function ensureContactOutTab() {
+  if (S.coTabId != null) {
+    try { await chrome.tabs.get(S.coTabId); return S.coTabId; }
+    catch { S.coTabId = null; }
+  }
+  const tab = await chrome.tabs.create({ url: CO_SEARCH_URL, active: false });
+  S.coTabId = tab.id;
+  await waitForLoad(tab.id);
+  await sleep(4000);   // SPA settle
+  return tab.id;
+}
+
+async function coSearchViaTab(cfg, profile) {
+  const tabId = await ensureContactOutTab();
+
+  // Reload rather than trusting leftover React state from the previous candidate.
+  await chrome.tabs.update(tabId, { url: CO_SEARCH_URL });
+  await waitForLoad(tabId);
+  await sleep(3500);
+
+  const filled = await runInTab(tabId, fillSearchFormFn, {
+    firstName: profile.firstName,
+    schools: profile.education.map(e => e.school).filter(Boolean),
+  });
+  if (!filled || !filled.ok) {
+    throw new PauseRun(`ContactOut form could not be filled (${(filled && filled.error) || 'no result'}) — is the dashboard logged in?`);
+  }
+  if (!filled.schoolsApplied && profile.education.length) {
+    await pushLog(`  no School/Degree option matched "${profile.education[0].school}" — searching on name alone.`, 'warn');
+  }
+
+  const out = await runInTab(tabId, scrapeResultsFn, cfg.maxCandidates);
+  if (!out) throw new Error('ContactOut results scrape returned nothing');
+  if (out.status === 'quota') throw new PauseRun('ContactOut credits exhausted or upgrade required');
+  if (out.status === 'unknown') {
+    // Card layout changed — surface a sample rather than guessing at selectors.
+    await pushLog('ContactOut results not recognised — see the SW console for a DOM sample.', 'error');
+    console.log('[ContactOut debugSample]', out.debugSample);
+    throw new PauseRun('ContactOut results DOM not recognised');
+  }
+
+  // ContactOut caps the page at 15; `total` is how many the name really matched.
+  if (out.total > (out.results || []).length) {
+    await pushLog(`  "${profile.firstName}" matched ${out.total} profiles — reading the first ${out.results.length}.`, 'warn');
+  }
+
+  const all = normalize(out.results || []);
+  return { all, kept: filterByLastInitial(all, profile.lastInitial) };
+}
+
+async function coRevealViaTab(match) {
+  const tabId = await ensureContactOutTab();
+  const out = await runInTab(tabId, revealEmailFn, match.linkedin);
+  if (!out) return '';
+  if (out.status === 'quota') throw new PauseRun('ContactOut credits exhausted');
+  return out.status === 'ok' ? out.email : '';
+}
+
 // `status` distinguishes a genuinely empty page from a failed scrape — conflating
 // them used to end the sweep early and log it as success.
 async function loadPage(cfg, page) {
@@ -452,7 +520,7 @@ async function processCandidate(cfg, cand) {
       skills: data.skills,
     };
 
-    const { all, kept } = await coSearch(cfg, profile);
+    const { all, kept } = await coSearchViaTab(cfg, profile);
     if (!all.length) {
       await pushLog(`— ${label}: no ContactOut results for "${firstName}".`);
       return true;
@@ -480,7 +548,14 @@ async function processCandidate(cfg, cand) {
     }
 
     const winner = pool[verdict.index];
-    const email = await coEmail(cfg, winner);
+    // Checked after matching, not before: dropping email-less cards from the pool
+    // first would let a confident match land on the wrong person instead.
+    if (!winner.hasEmail) {
+      await pushLog(`— ${label} → ${winner.fullName}: matched, but ContactOut lists no email.`);
+      return true;
+    }
+
+    const email = await coRevealViaTab(winner);
     if (!email) {
       await pushLog(`— ${label} → ${winner.fullName}: matched, but no email available.`);
       return true;
@@ -495,6 +570,7 @@ async function processCandidate(cfg, cand) {
       education: data.education.map(e => e.school).join('; '),
       match_confidence: String(verdict.confidence),
       match_source: verdict.source,
+      email_verified: winner.verified ? 'Verified' : '',
       job_success_score: data.jss,
       badge: data.badge,
       hourly_rate: data.hourlyRate,
@@ -573,19 +649,20 @@ async function drive() {
 async function cmdStart() {
   const cfg = await loadConfig();
   if (!cfg.searchUrl) { await pushLog('Set a search URL first.', 'error'); return; }
-  if (!cfg.contactOutToken) { await pushLog('Set a ContactOut token first.', 'error'); return; }
 
   // Orphaned tabs from a previous run would otherwise pile up.
   if (S.searchTabId != null) await closeTab(S.searchTabId);
   if (S.profileTabId != null) await closeTab(S.profileTabId);
+  if (S.coTabId != null) await closeTab(S.coTabId);
 
   S = {
     status: 'running', captcha: false,
     page: parsePage(cfg.searchUrl),
     queue: [], queueIndex: 0,
-    searchTabId: null, profileTabId: null,
+    searchTabId: null, profileTabId: null, coTabId: null,
     processed: 0, emails: 0, current: ''
   };
+  await pushLog('Log in to contactout.com in this browser before starting.', 'info');
   await pushLog(`Start — search from page ${S.page}.`, 'ok');
   await persistState();
   drive();
@@ -607,6 +684,7 @@ async function cmdStop() {
   S.status = 'idle'; S.captcha = false; S.queue = []; S.queueIndex = 0; S.current = '';
   if (S.searchTabId != null) { await closeTab(S.searchTabId); S.searchTabId = null; }
   if (S.profileTabId != null) { await closeTab(S.profileTabId); S.profileTabId = null; }
+  if (S.coTabId != null) { await closeTab(S.coTabId); S.coTabId = null; }
   setBadge(false); await pushLog('Stopped.', 'warn'); await persistState();
 }
 

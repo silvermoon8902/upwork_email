@@ -5,7 +5,6 @@ const $ = id => document.getElementById(id);
 // Field name -> how to read/write it. Must stay in sync with DEFAULT_CONFIG.
 const CFG_FIELDS = {
   searchUrl:       'text',
-  contactOutToken: 'text',
   openaiKey:       'text',
   openaiModel:     'text',
   postEndpoint:    'text',

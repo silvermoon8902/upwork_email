@@ -13,8 +13,9 @@ Search URL (page N from its page= param)
        └─ scrape: name, country, title, education, skills, job success,
                   badge, hourly rate, total earning, linked-GitHub flag
             └─ skip if a GitHub account is linked (skipIfGithub)
-                 └─ ContactOut search on FIRST NAME ONLY ("Zyad K." → "Zyad"),
-                    narrowed by education / country / title
+                 └─ ContactOut dashboard, driven in a logged-in tab:
+                    Name = FIRST NAME ONLY ("Zyad K." → "Zyad"),
+                    School/Degree = the freelancer's schools
                       └─ post-filter on the last initial (surname must start "K")
                            └─ match: school overlap (free) → OpenAI (paid)
                                 └─ above threshold → reveal email → POST
@@ -76,7 +77,7 @@ skipped rather than guessed.
 1. `chrome://extensions` → enable **Developer mode** → **Load unpacked** → this folder.
 2. Click the toolbar icon → **Settings**:
    - **Search URL** — the run starts at its `page=` value; no `page=` ⇒ page 1.
-   - **ContactOut API token** — required.
+   - **ContactOut** — no token; log in to contactout.com in this browser first.
    - **OpenAI API key** / **model** — optional; enables tier-2 matching.
    - **POST endpoint** — the Apps Script `/exec` URL.
    - **Delays** — randomized wait between profiles (default 4–10s). Higher = fewer captchas.
@@ -102,7 +103,7 @@ The run auto-pauses (rather than burning through the queue) on:
 ## Files
 - `manifest.json` — MV3 manifest (module service worker)
 - `background.js` — orchestrator (search walk, profile scrape, matching, POST)
-- `contactout.js` — ContactOut search + email reveal
+- `contactout_ui.js` — ContactOut search + email reveal, driven through the dashboard UI
 - `matcher.js` — school-overlap and OpenAI matching
 - `errors.js` — `PauseRun`, the errors that stop the sweep
 - `imghash.js` — perceptual image hashing (not wired into the pipeline)
@@ -110,10 +111,15 @@ The run auto-pauses (rather than burning through the queue) on:
 - `apps_script.gs` — Google Sheet sink
 
 ## Tuning notes
-- **ContactOut**: endpoint paths, filter field names and the response shape in
-  `contactout.js` are a best-effort mapping — **verify them against current
-  docs**. Everything provider-specific lives in `ENDPOINTS`, `buildQuery()` and
-  `normalize()`.
+- **ContactOut**: there is no API token — the dashboard is driven in a tab, so
+  **you must be logged into contactout.com in this browser**. Selectors in
+  `contactout_ui.js` avoid the hashed `css-*` classes (they rotate on every
+  ContactOut deploy) and use `data-testid` plus icon `viewBox` values instead. If
+  the card layout does change, the run pauses and dumps a DOM sample to the
+  service-worker console.
+- **Results are capped at 15 per page.** A common first name matches far more
+  (the log warns with the real total), so education is what makes the search
+  usable — without it the right person may not be on page 1 at all.
 - **Upwork DOM**: Vue with hashed `data-v-*` attrs, so it drifts. The scrapers use
   resilient selectors with text fallbacks; if a field comes back empty, adjust
   `scrapeSearchPage()` / `scrapeProfile()` in `background.js`.

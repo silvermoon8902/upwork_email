@@ -62,6 +62,9 @@ export async function aiMatch(cfg, profile, candidates) {
     company: c.company,
     location: c.location,
     education: c.education,
+    // Role history disambiguates namesakes better than the headline alone —
+    // a ContactOut search on a common first name returns dozens.
+    experience: (c.experience || []).slice(0, 5),
   }));
 
   const user = [

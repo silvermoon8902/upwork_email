@@ -49,3 +49,9 @@ label.check {
   font-weight: 400; margin: 10px 0 4px;
 }
 label.check input { width: auto; margin: 0; }
+
+.note {
+  font-size: 11px; color: #666; line-height: 1.4;
+  margin: 10px 0 4px; padding: 6px 8px;
+  background: #f4f4f6; border-radius: 4px;
+}
