@@ -165,10 +165,31 @@ its idle pane — `scrapeResultsFn` reports that as `not-searched`, which is del
 from `unknown` (layout changed). Conflating them made a search that never fired look like a
 selector problem.
 
-`coSearchViaTab` sends **`nm` + `school` + `location`** (location from Upwork's
-`country-name`), and retries without the school when that returns `empty`: ContactOut's school
-taxonomy doesn't always match Upwork's wording, and a school that matches nothing filters out
-the very person being looked for.
+`coSearchViaTab` runs an **escalating ladder**, narrowest first, taking the first tier that
+returns anything: `school+title+location` → `school+location` → `title+location` → `location`.
+It widens on `empty` because ContactOut's school and job-title taxonomies don't always match
+Upwork's wording, and a filter matching nothing excludes the very person being looked for.
+
+A first name plus a country is nowhere near sufficient on its own — "Anna" in Ukraine is 53,715
+people, "Jennifer" in the USA is over a million. When a result is still above `MAX_SEARCH_TOTAL`
+the **surname initial** is appended to `nm` as a last resort (`nm=Jereme B`); that extra page
+load only happens for candidates that would otherwise be skipped.
+
+Confirmed params: `nm`, `school`, `location`. **`title` is a guess** (`<label for="title">`) —
+a wrong param name is ignored rather than fatal, so the tell is `total` not dropping.
+
+**`school` must be ContactOut's own name for the school, not Upwork's.** School/Degree is an
+autocomplete over their taxonomy, so `resolveSchool` types the Upwork string into the field
+(`lookupSchoolFn`), reads the menu labels, and picks the canonical one with `bestSchoolMatch`.
+Results are cached in `schoolCache` for the life of the service worker — schools repeat heavily
+across a sweep and each lookup costs a couple of seconds of typing and polling.
+
+**The menu's first option is a verbatim echo of the typed text** — typing "full" offers "full"
+above "Full Sail University". It is free text, not a taxonomy entry. `bestSchoolMatch` drops it
+unless it is the only option, and `pick()` in `fillSearchFormFn` skips to `opts[1]` for the same
+reason; selecting `opts[0]` blindly files the raw query as the filter value. `bestSchoolMatch`
+returns `''` below a 0.5 similarity score rather than guessing — an unrecognised school excludes
+the very person being searched for, which is worse than no school filter at all.
 
 **The search URL is logged on every query**, because a filter that silently fails to narrow is
 otherwise invisible — a name-only search returns absurd totals ("Jennifer" matched 1,492,077)
@@ -279,6 +300,14 @@ every tick.
 ## Behaviors not in the README
 
 - `SKIP_COUNTRIES` at the top of `background.js` drops candidates by lowercased
-  `[itemprop="country-name"]` match before any paid lookup.
+  `[itemprop="country-name"]` match before any paid lookup. It runs **twice**: once against the
+  country `scrapeSearchPage` lifts off the result tile (no tab opened at all — this is the bulk
+  of the saving, since most candidates in a typical sweep are country-skips), and again after
+  the profile scrape for tiles that don't expose it. When walking up from a candidate link to
+  find that country, `scrapeSearchPage` stops as soon as the ancestor spans more than one
+  candidate id — one level too far and every row inherits the first row's country.
+- `scrapeProfile`'s `sectionByHeading` must include **`h5`**. Upwork uses `h5` for most profile
+  section headings, and omitting it silently returned an empty `education` list for every
+  candidate — which in turn dropped the `school` filter from every ContactOut query.
 - A profile with neither education nor a title is skipped — a first name alone is too broad a
   ContactOut query to be worth a credit.

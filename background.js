@@ -20,7 +20,7 @@
 
 import {
   CO_SEARCH_URL, buildSearchUrl, fillSearchFormFn, scrapeResultsFn, revealEmailFn,
-  normalize, filterByLastInitial
+  lookupSchoolFn, bestSchoolMatch, normalize, filterByLastInitial
 } from './contactout_ui.js';
 import { deterministicMatch, aiMatch } from './matcher.js';
 import { PauseRun, shouldPause } from './errors.js';
@@ -204,7 +204,26 @@ function scrapeSearchPage() {
     const tile = a.closest('section, article, [data-test*="Tile"], [data-test*="Card"], div');
     const nameEl = (tile && tile.querySelector('[itemprop="name"], h3, h4')) || a;
     name = (nameEl.textContent || '').replace(/\s+/g, ' ').trim();
-    out.push({ id, name, profileUrl: 'https://www.upwork.com/freelancers/' + id });
+
+    // Country off the tile lets the country filter run before a profile tab is
+    // ever opened. Walk up only while the ancestor still holds this one
+    // candidate — one level too far and every row inherits the first row's
+    // country, which would skip the wrong people.
+    let country = '';
+    let node = a;
+    for (let i = 0; i < 8 && node.parentElement; i++) {
+      node = node.parentElement;
+      const ids = new Set();
+      node.querySelectorAll('a[href*="~"]').forEach(link => {
+        const mm = (link.getAttribute('href') || '').match(/~([0-9a-z]{8,})/i);
+        if (mm) ids.add(mm[1]);
+      });
+      if (ids.size > 1) break;                       // now spanning several tiles
+      const c = node.querySelector('[itemprop="country-name"]');
+      if (c) { country = (c.textContent || '').replace(/\s+/g, ' ').trim(); break; }
+    }
+
+    out.push({ id, name, country, profileUrl: 'https://www.upwork.com/freelancers/' + id });
   });
 
   // Candidates rendering means whatever was in the way has cleared.
@@ -225,9 +244,11 @@ function scrapeSearchPage() {
 function scrapeProfile() {
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
 
-  // Find the container of the section whose heading matches `re`.
+  // Find the container of the section whose heading matches `re`. Upwork uses h5
+  // for most profile section headings (Languages, Verifications, Education) and
+  // h4 for a few — omitting h5/h6 here silently emptied the education list.
   const sectionByHeading = re => {
-    const heads = document.querySelectorAll('h2, h3, h4, [data-qa$="-title"], .air3-card-section h4');
+    const heads = document.querySelectorAll('h2, h3, h4, h5, h6, [data-qa$="-title"], [role="presentation"]');
     for (const h of heads) {
       if (re.test(clean(h.textContent))) return h.closest('section, .air3-card-section, div') || h.parentElement;
     }
@@ -299,7 +320,8 @@ function scrapeProfile() {
 
   // Education: school lines are the ones without a year range or degree prefix.
   const education = [];
-  const eduSec = document.querySelector('[data-qa="education"]') || sectionByHeading(/^education$/i);
+  const eduSec = document.querySelector('[data-qa="education"], [data-cy="education"], .education-section')
+    || sectionByHeading(/^education$/i);
   if (eduSec) {
     const lines = (eduSec.innerText || '').split('\n').map(clean)
       .filter(l => l && !/^education$/i.test(l));
@@ -517,19 +539,70 @@ async function coSearchOnce(cfg, profile, filters) {
   return out;
 }
 
+/* A first name plus a country is nowhere near enough — "Anna" in Ukraine is
+ * 53,715 people. So the query starts as narrow as the Upwork profile allows and
+ * widens only when a tier comes back empty, because ContactOut's school and
+ * job-title taxonomies won't always match Upwork's wording and a filter that
+ * matches nothing excludes the very person being looked for. */
+/* Upwork's school wording is not ContactOut's. Feed it through the School/Degree
+ * autocomplete to get the taxonomy's own name for it — an unrecognised value is
+ * either ignored or matches nothing, and either way the filter stops helping.
+ * Cached because schools repeat heavily across a sweep and each lookup is a
+ * couple of seconds of typing and polling. */
+const schoolCache = new Map();
+
+async function resolveSchool(upworkSchool) {
+  const key = upworkSchool.toLowerCase().trim();
+  if (schoolCache.has(key)) return schoolCache.get(key);
+
+  let canonical = '';
+  try {
+    const tabId = await ensureContactOutTab();
+    const out = await runInTab(tabId, lookupSchoolFn, upworkSchool);
+    canonical = bestSchoolMatch(upworkSchool, (out && out.options) || []);
+  } catch (e) {
+    await pushLog(`  school lookup failed for "${upworkSchool}": ${e}`, 'warn');
+  }
+
+  if (canonical && canonical.toLowerCase() !== key) {
+    await pushLog(`  school "${upworkSchool}" → "${canonical}".`);
+  } else if (!canonical) {
+    await pushLog(`  ContactOut has no school matching "${upworkSchool}" — searching without it.`, 'warn');
+  }
+
+  schoolCache.set(key, canonical);
+  return canonical;
+}
+
 async function coSearchViaTab(cfg, profile) {
-  const school = (profile.education[0] || {}).school || '';
+  const upworkSchool = (profile.education[0] || {}).school || '';
+  const school = upworkSchool ? await resolveSchool(upworkSchool) : '';
   const location = profile.country || '';
+  const title = profile.title || '';
 
-  // Narrowest first. Both filters matter: a first name on its own returns
-  // hundreds of thousands of people, and reading 8 of those is a lottery.
-  let out = await coSearchOnce(cfg, profile, { school, location });
+  const tiers = [];
+  if (school && title) tiers.push({ school, title, location });
+  if (school) tiers.push({ school, location });
+  if (title) tiers.push({ title, location });
+  tiers.push({ location });
 
-  // ContactOut's school taxonomy won't always match Upwork's wording, and a
-  // school that matches nothing filters the real person out entirely.
-  if (school && out.status === 'empty') {
-    await pushLog(`  no results with school "${school}" — retrying on name + location.`, 'warn');
-    out = await coSearchOnce(cfg, profile, { location });
+  let out = null;
+  for (const filters of tiers) {
+    out = await coSearchOnce(cfg, profile, filters);
+    if (out.status !== 'empty') break;
+    await pushLog('  no results at that filter level — widening.', 'warn');
+  }
+
+  // Still hopeless on the widest useful tier. The last initial is the only
+  // signal left, and it only costs a page load in cases already being skipped.
+  if (out.total > MAX_SEARCH_TOTAL && profile.lastInitial) {
+    await pushLog(`  ${out.total} matches — retrying with surname initial "${profile.lastInitial}".`, 'warn');
+    const narrowed = await coSearchOnce(cfg, profile, {
+      ...tiers[0], surnameInitial: profile.lastInitial
+    });
+    if (narrowed.status === 'ok' && narrowed.total && narrowed.total <= MAX_SEARCH_TOTAL) {
+      out = narrowed;
+    }
   }
 
   const read = (out.results || []).length;
@@ -537,9 +610,9 @@ async function coSearchViaTab(cfg, profile) {
     await pushLog(`  "${profile.firstName}" matched ${out.total} profiles — reading the first ${read}.`, 'warn');
   }
 
-  // Past this point the filters plainly aren't biting. Matching 8 arbitrary
-  // rows out of tens of thousands can't succeed, and every attempt costs an
-  // OpenAI call — so report it as too broad rather than guessing.
+  // Past this point the filters plainly aren't biting. Matching a couple of
+  // dozen arbitrary rows out of tens of thousands can't succeed, and every
+  // attempt costs an OpenAI call — report it rather than guessing.
   if (out.total > MAX_SEARCH_TOTAL) {
     return { all: [], kept: [], tooBroad: true, total: out.total };
   }
@@ -649,6 +722,15 @@ async function pauseForQuota(msg) {
  * the run paused mid-candidate and it must be retried on Resume. */
 async function processCandidate(cfg, cand) {
   S.current = cand.name || cand.id;
+
+  // Cheapest possible skip: the search tile already carried the country, so
+  // don't spend a tab load and a scrape on someone who is filtered out anyway.
+  // (Absent on tiles that don't expose it — those fall through to the scrape.)
+  if (cand.country && SKIP_COUNTRIES.indexOf(cand.country.toLowerCase()) !== -1) {
+    await pushLog(`⏭ ${cand.name || cand.id}: ${cand.country} — skipped from search page.`);
+    return true;
+  }
+
   await pushLog(`▶ ${cand.name || cand.id} — opening profile…`);
 
   // Reuse a tab left open for captcha solving; otherwise open a fresh one.

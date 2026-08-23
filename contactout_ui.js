@@ -30,12 +30,22 @@ export const CO_SEARCH_URL = 'https://contactout.com/dashboard/search';
 export function buildSearchUrl(firstName, opts) {
   const o = opts || {};
   const u = new URL(CO_SEARCH_URL);
-  u.searchParams.set('nm', firstName);
+  // Upwork hides surnames, but appending the initial it *does* expose is the
+  // last narrowing signal available when a first name alone is hopeless.
+  u.searchParams.set('nm', o.surnameInitial ? `${firstName} ${o.surnameInitial}` : firstName);
   u.searchParams.set('page', String(o.page || 1));
   if (o.school) u.searchParams.set('school', o.school);
   if (o.location) u.searchParams.set('location', o.location);
+  if (o.title) u.searchParams.set(CO_TITLE_PARAM, o.title);
   return u.toString();
 }
+
+/* UNCONFIRMED. The Job title field is labelled <label for="title">, so `title`
+ * is the best guess at its query param; `nm`, `school` and `location` are all
+ * confirmed. A wrong name here is ignored rather than fatal — the result total
+ * simply won't drop. Run one search by hand with a job title set and read the
+ * URL to settle it. */
+const CO_TITLE_PARAM = 'title';
 
 /* --------------------------- injected: fill form ------------------------- */
 
@@ -92,12 +102,16 @@ export async function fillSearchFormFn(query) {
       const menu = label.querySelector('.contactout-select__menu')
         || document.querySelector('.contactout-select__menu');
       if (!menu) continue;
-      const opts = menu.querySelectorAll('.contactout-select__option, [id*="-option-"]');
+      const opts = Array.from(menu.querySelectorAll('.contactout-select__option, [id*="-option-"]'));
       if (!opts.length) continue;
+      // The first option echoes the typed text verbatim — that is free text,
+      // not a taxonomy entry. Take the first real suggestion when one exists.
+      const echoed = norm(opts[0].textContent).toLowerCase() === norm(value).toLowerCase();
+      const target = (echoed && opts.length > 1) ? opts[1] : opts[0];
       // react-select commits on mousedown, not click.
-      opts[0].dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-      opts[0].dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-      opts[0].click();
+      target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      target.click();
       await sleep(400);
       return true;
     }
@@ -130,6 +144,54 @@ export async function fillSearchFormFn(query) {
   searchBtn.click();
 
   return { ok: true, schoolsApplied };
+}
+
+/* ---------------------- injected: resolve a school ----------------------- */
+
+/* School/Degree is an autocomplete over ContactOut's own taxonomy, so Upwork's
+ * wording has to be translated before it can be used as a `school=` filter.
+ * Type the Upwork string, read the menu, hand the labels back — nothing is
+ * selected here, this is a lookup only.
+ *
+ * The first option is always a verbatim echo of what was typed (typing "full"
+ * offers "full" above "Full Sail University"), i.e. free text rather than a
+ * real school. bestSchoolMatch() below is what discards it. */
+
+/** args: school string -> { options: string[] } */
+export async function lookupSchoolFn(query) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const norm = s => (s || '').replace(/ /g, ' ').replace(/\s+/g, ' ').trim();
+
+  const setNative = (el, value) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, value);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+
+  let label = null;
+  for (const l of document.querySelectorAll('label')) {
+    const span = l.querySelector('span');
+    if (span && norm(span.textContent) === 'School/Degree') { label = l; break; }
+  }
+  const input = label && label.querySelector('input.contactout-select__input');
+  if (!input) return { options: [], error: 'school field not found' };
+
+  input.focus();
+  setNative(input, query);
+
+  let options = [];
+  for (let i = 0; i < 24; i++) {
+    await sleep(250);
+    const menu = label.querySelector('.contactout-select__menu')
+      || document.querySelector('.contactout-select__menu');
+    if (!menu) continue;
+    const opts = menu.querySelectorAll('.contactout-select__option, [id*="-option-"]');
+    if (!opts.length) continue;
+    options = Array.from(opts).map(o => norm(o.textContent)).filter(Boolean);
+    break;
+  }
+
+  setNative(input, '');   // leave the field as we found it
+  return { options };
 }
 
 /* ------------------------- injected: read results ------------------------ */
@@ -319,6 +381,43 @@ export function normalize(rows) {
       emails: [],
     };
   }).filter(r => r.fullName);
+}
+
+/* Pick ContactOut's canonical school for an Upwork school string.
+ *
+ * The menu's first entry is a verbatim echo of the query — free text, not a
+ * taxonomy entry — so it is only accepted when nothing real scores well enough.
+ * Returns '' rather than a weak guess: a school ContactOut doesn't recognise
+ * filters out the very person being searched for. */
+export function bestSchoolMatch(query, options) {
+  const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const q = norm(query);
+  if (!q || !options || !options.length) return '';
+
+  const tokens = s => new Set(norm(s).split(' ').filter(t => t.length > 2));
+  const qt = tokens(query);
+
+  const score = opt => {
+    const o = norm(opt);
+    if (!o) return 0;
+    if (o === q) return 1;
+    if (o.includes(q) || q.includes(o)) return 0.9;
+    const ot = tokens(opt);
+    if (!qt.size || !ot.size) return 0;
+    let shared = 0;
+    qt.forEach(t => { if (ot.has(t)) shared++; });
+    return shared / Math.max(qt.size, ot.size);
+  };
+
+  // Drop the echo unless it is the only thing on offer.
+  const real = options.length > 1 && norm(options[0]) === q ? options.slice(1) : options;
+
+  let best = '', bestScore = 0;
+  for (const opt of real) {
+    const s = score(opt);
+    if (s > bestScore) { bestScore = s; best = opt; }
+  }
+  return bestScore >= 0.5 ? best : '';
 }
 
 /** Upwork exposes the last initial ("Zyad K.") — drop surnames that contradict it. */
