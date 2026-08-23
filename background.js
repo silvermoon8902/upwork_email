@@ -244,13 +244,26 @@ function scrapeSearchPage() {
 function scrapeProfile() {
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
 
-  // Find the container of the section whose heading matches `re`. Upwork uses h5
-  // for most profile section headings (Languages, Verifications, Education) and
-  // h4 for a few — omitting h5/h6 here silently emptied the education list.
+  /* Find the body of the section whose heading matches `re`.
+   *
+   * Upwork uses h4/h5 with role="presentation" for section headings, and wraps
+   * each one in its own layout div. `closest('… , div')` therefore returns that
+   * wrapper — a container holding nothing but the title — which is why this
+   * used to yield an empty education list. Walk up instead, stopping at the
+   * first ancestor that actually carries content beyond the heading: that is
+   * the card body, and stopping there also prevents swallowing the next
+   * section's entries. */
   const sectionByHeading = re => {
     const heads = document.querySelectorAll('h2, h3, h4, h5, h6, [data-qa$="-title"], [role="presentation"]');
     for (const h of heads) {
-      if (re.test(clean(h.textContent))) return h.closest('section, .air3-card-section, div') || h.parentElement;
+      if (!re.test(clean(h.textContent))) continue;
+      const headLen = clean(h.textContent).length;
+      let el = h;
+      for (let i = 0; i < 8 && el.parentElement; i++) {
+        el = el.parentElement;
+        if (clean(el.innerText || '').length > headLen + 15) return el;
+      }
+      return h.parentElement;
     }
     return null;
   };
@@ -264,12 +277,25 @@ function scrapeProfile() {
   const nameEl = document.querySelector('h1[itemprop="name"], h2[itemprop="name"], [itemprop="name"]');
   if (nameEl) name = clean(nameEl.textContent);
 
+  // Two traps here. `.air3-card-section h2` alone matches the *name* heading,
+  // which is in the same section. And Upwork ships hidden popovers inside those
+  // sections whose headings are also h2 — "Show you're a match" is one, and it
+  // was being scraped as the job title on every profile that renders it.
+  const inPopover = el => !!el.closest(
+    '.air3-popper, .air3-popover, .air3-tooltip, [data-test="popper"], [role="tooltip"]');
+  const laidOut = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+
   let title = '';
-  // `.air3-card-section h2` on its own matches the *name* heading — it lives in
-  // the same section — so the title has to exclude it.
-  const titleEl = document.querySelector(
-    '[data-qa="freelancer-title"], h2[data-qa="title"], .air3-card-section h2:not([itemprop="name"])');
-  if (titleEl) title = clean(titleEl.textContent);
+  const titleEls = document.querySelectorAll(
+    '[data-qa="freelancer-title"], h2[data-qa="title"], .air3-card-section h1, .air3-card-section h2');
+  for (const el of titleEls) {
+    if (el.hasAttribute('itemprop')) continue;        // the name heading
+    if (inPopover(el) || !laidOut(el)) continue;      // hidden announcement popovers
+    const t = clean(el.textContent);
+    if (!t || t === name) continue;
+    title = t;
+    break;
+  }
 
   let hourlyRate = '';
   const rm = txt.match(/\$\s?[\d,.]+\s*\/\s*hr/i);
@@ -319,18 +345,45 @@ function scrapeProfile() {
   if (cEl) country = clean(cEl.textContent);
 
   // Education: school lines are the ones without a year range or degree prefix.
+  /* Education card:
+   *   <div class="air3-card … profile-outer-card">
+   *     <div><div class="flex-1"><h4>Education</h4></div></div>
+   *     <section class="air3-card-sections"><ul class="list-unstyled">
+   *       <li class="air3-card-section">
+   *         <h4 role="presentation">European University of Bangladesh</h4>
+   *         <div>Bachelor of Accountancy (BAcc) | 2022-2026</div>
+   *       </li>
+   *   One <li> per school, name in the heading, "<Degree> | <years>" beside it.
+   *   Note the entry headings are h4 too — anchoring on the card's own
+   *   "Education" heading is what keeps them apart. */
   const education = [];
-  const eduSec = document.querySelector('[data-qa="education"], [data-cy="education"], .education-section')
+  const eduHead = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'))
+    .find(h => /^education$/i.test(clean(h.textContent)) && !inPopover(h) && laidOut(h));
+  const eduCard = (eduHead && eduHead.closest('.profile-outer-card, .air3-card'))
+    || document.querySelector('[data-qa="education"], [data-cy="education"], .education-section')
     || sectionByHeading(/^education$/i);
-  if (eduSec) {
-    const lines = (eduSec.innerText || '').split('\n').map(clean)
-      .filter(l => l && !/^education$/i.test(l));
-    let pending = null;
-    for (const line of lines) {
-      const isDetail = /\b(19|20)\d{2}\b/.test(line)
-        || /^(bachelor|master|associate|doctor|ph\.?d|b\.?s|m\.?s|b\.?a|m\.?a|mba|bsc|msc|diploma|certificate)/i.test(line);
-      if (isDetail) { if (pending) pending.detail = line; }
-      else { pending = { school: line, detail: '' }; education.push(pending); }
+
+  if (eduCard) {
+    eduCard.querySelectorAll('li').forEach(li => {
+      const h = li.querySelector('h3, h4, h5, h6, [role="presentation"]');
+      const school = clean(h && h.textContent);
+      if (!school || /^education$/i.test(school)) return;
+      const detail = clean((li.querySelector('div') || {}).textContent);
+      if (!education.some(e => e.school === school)) education.push({ school, detail });
+    });
+
+    // Fallback for any layout that isn't the <li> list: split the card's text,
+    // treating a line with a year or a degree prefix as detail for the line above.
+    if (!education.length) {
+      const lines = (eduCard.innerText || '').split('\n').map(clean)
+        .filter(l => l && !/^education$/i.test(l));
+      let pending = null;
+      for (const line of lines) {
+        const isDetail = /\b(19|20)\d{2}\b/.test(line)
+          || /^(bachelor|master|associate|doctor|ph\.?d|b\.?s|m\.?s|b\.?a|m\.?a|mba|bsc|msc|diploma|certificate)/i.test(line);
+        if (isDetail) { if (pending) pending.detail = line; }
+        else { pending = { school: line, detail: '' }; education.push(pending); }
+      }
     }
   }
 
@@ -531,8 +584,9 @@ async function coSearchOnce(cfg, profile, filters) {
   if (out.status === 'quota') throw new PauseRun('ContactOut credits exhausted or upgrade required');
   if (out.status === 'not-searched') throw new PauseRun('ContactOut never ran the search');
   if (out.status === 'unknown') {
-    // Card layout changed — surface a sample rather than guessing at selectors.
-    await pushLog('ContactOut results not recognised — see the SW console for a DOM sample.', 'error');
+    // Show the page's own words in the log — usually enough to tell an
+    // unrecognised empty/upsell state from an actual card-layout change.
+    await pushLog(`ContactOut page not recognised: "${out.textSample || ''}"`, 'error');
     console.log('[ContactOut debugSample]', out.debugSample);
     throw new PauseRun('ContactOut results DOM not recognised');
   }
@@ -575,15 +629,21 @@ async function resolveSchool(upworkSchool) {
 }
 
 async function coSearchViaTab(cfg, profile) {
-  const upworkSchool = (profile.education[0] || {}).school || '';
-  const school = upworkSchool ? await resolveSchool(upworkSchool) : '';
+  // A profile can list several schools and ContactOut may only know one of
+  // them — take the first that resolves rather than giving up on entry [0].
+  let school = '';
+  for (const entry of profile.education.slice(0, 3)) {
+    if (!entry.school) continue;
+    school = await resolveSchool(entry.school);
+    if (school) break;
+  }
   const location = profile.country || '';
-  const title = profile.title || '';
 
+  // School is the narrowing signal; job title is deliberately not sent. Upwork
+  // headlines are marketing copy ("Expert Logo Designer | Modern Minimalist…"),
+  // not job titles, so they match nothing in ContactOut's taxonomy.
   const tiers = [];
-  if (school && title) tiers.push({ school, title, location });
   if (school) tiers.push({ school, location });
-  if (title) tiers.push({ title, location });
   tiers.push({ location });
 
   let out = null;

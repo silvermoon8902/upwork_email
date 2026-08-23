@@ -129,12 +129,37 @@ body-text matching:
   caption ("Total earnings" / "Total jobs" / "Total hours"), because the columns share one
   markup shape and their order isn't guaranteed. The old innerText regex is kept only as a
   fallback. `statByLabel` also yields Total jobs / Total hours if those are ever wanted.
-- **Title** must exclude `[itemprop="name"]`. A bare `.air3-card-section h2` matches the
-  freelancer's *name* heading, which sits in the same section, so the title silently came
-  back as "Jaclyn B.".
+- **Title** must exclude `[itemprop="name"]` *and* hidden popovers. A bare
+  `.air3-card-section h2` matches the freelancer's *name* heading, which sits in the same
+  section — and also Upwork's `display:none` feature-announcement popovers, whose headings are
+  h2 inside those sections. That is how "Show you're a match" ended up being scraped as a job
+  title. The loop skips `[itemprop]`, anything inside `.air3-popper`/`.air3-popover`/
+  `.air3-tooltip`, and anything with no layout box.
 
 Job success has a second source: the progress ring carries the number in a class
 (`air3-progress-circle-99`), read with `getAttribute('class')` since those are SVG nodes.
+
+**Education** is the filter the whole ContactOut query depends on, and it is read from real
+selectors, not `innerText` heuristics:
+
+```html
+<div class="air3-card … profile-outer-card">
+  <div><div class="flex-1"><h4>Education</h4></div></div>          <!-- card heading -->
+  <section class="air3-card-sections"><ul class="list-unstyled">
+    <li class="air3-card-section">
+      <h4 role="presentation">European University of Bangladesh</h4>  <!-- school -->
+      <div>Bachelor of Accountancy (BAcc) | 2022-2026</div>           <!-- detail -->
+```
+
+One `<li>` per school. **The entry headings are `h4` exactly like the card's own "Education"
+heading**, so the code anchors on the card heading, takes `closest('.profile-outer-card,
+.air3-card')`, and reads the `<li>`s inside it. A profile can list several schools;
+`coSearchViaTab` resolves each in turn and uses the first ContactOut recognises.
+
+Two dead ends already hit here, so don't reintroduce them: `sectionByHeading` must not use
+`closest('… , div')` (Upwork wraps every heading in its own layout div, so that returns a
+container holding only the word "Education"), and `h5` must stay in the heading selector list.
+The text-line fallback is kept only for layouts without the `<li>` list.
 
 `scrapeProfileWithRetry` requires `name` **and** at least one of education/skills before
 accepting a scrape. Keying only on `name` returns on first paint and never gives the
@@ -166,17 +191,23 @@ from `unknown` (layout changed). Conflating them made a search that never fired 
 selector problem.
 
 `coSearchViaTab` runs an **escalating ladder**, narrowest first, taking the first tier that
-returns anything: `school+title+location` → `school+location` → `title+location` → `location`.
-It widens on `empty` because ContactOut's school and job-title taxonomies don't always match
-Upwork's wording, and a filter matching nothing excludes the very person being looked for.
+returns anything: `school+location` → `location`. It widens on `empty` because ContactOut's
+school taxonomy doesn't always match Upwork's wording, and a filter matching nothing excludes
+the very person being looked for.
+
+**Job title is deliberately not a search filter.** The param works (`title=`), but Upwork
+headlines are marketing copy — "Expert Logo Designer | Modern Minimalist Logo Design & Brand
+Identity" — not job titles, so they match nothing in ContactOut's taxonomy. `data.title` is
+still scraped, because [matcher.js](matcher.js) uses it as matching evidence.
 
 A first name plus a country is nowhere near sufficient on its own — "Anna" in Ukraine is 53,715
-people, "Jennifer" in the USA is over a million. When a result is still above `MAX_SEARCH_TOTAL`
-the **surname initial** is appended to `nm` as a last resort (`nm=Jereme B`); that extra page
-load only happens for candidates that would otherwise be skipped.
+people, "Jennifer" in the USA is over a million, so **school is the load-bearing filter**. When
+a result is still above `MAX_SEARCH_TOTAL` the **surname initial** is appended to `nm` as a last
+resort (`nm=Jereme B`); that extra page load only happens for candidates that would otherwise be
+skipped.
 
-Confirmed params: `nm`, `school`, `location`. **`title` is a guess** (`<label for="title">`) —
-a wrong param name is ignored rather than fatal, so the tell is `total` not dropping.
+Confirmed params: `nm`, `school`, `location`, `title` (all seen rendering as chips in the live
+form).
 
 **`school` must be ContactOut's own name for the school, not Upwork's.** School/Degree is an
 autocomplete over their taxonomy, so `resolveSchool` types the Upwork string into the field

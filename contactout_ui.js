@@ -36,16 +36,8 @@ export function buildSearchUrl(firstName, opts) {
   u.searchParams.set('page', String(o.page || 1));
   if (o.school) u.searchParams.set('school', o.school);
   if (o.location) u.searchParams.set('location', o.location);
-  if (o.title) u.searchParams.set(CO_TITLE_PARAM, o.title);
   return u.toString();
 }
-
-/* UNCONFIRMED. The Job title field is labelled <label for="title">, so `title`
- * is the best guess at its query param; `nm`, `school` and `location` are all
- * confirmed. A wrong name here is ignored rather than fatal — the result total
- * simply won't drop. Run one search by hand with a job title set and read the
- * URL to settle it. */
-const CO_TITLE_PARAM = 'title';
 
 /* --------------------------- injected: fill form ------------------------- */
 
@@ -221,7 +213,9 @@ export async function scrapeResultsFn(max) {
     }
     anchors = Array.from(document.querySelectorAll('a[data-testid="linkedin-link"]'));
     if (anchors.length) break;
-    if (/no results|no profiles found|0 profiles/i.test(body)) {
+    // ContactOut's zero-results pane offers a LinkedIn search instead of listing
+    // anything, and doesn't always use the words "no results".
+    if (/no results|no profiles found|0 profiles|no matching profiles|go to linkedin search|couldn't find|could not find|try (a )?(different|broader|another)|adjust your (search|filters)|broaden your search/i.test(body)) {
       return { status: 'empty', total: 0, results: [] };
     }
     // The dashboard's idle pane. Filters may be filled, but nothing was run —
@@ -236,8 +230,13 @@ export async function scrapeResultsFn(max) {
   const total = totalMatch ? parseInt(totalMatch[1].replace(/,/g, ''), 10) : anchors.length;
 
   if (!anchors.length) {
+    // Carry the visible text too — an unrecognised *state* (some new empty or
+    // upsell pane) is far likelier than an unrecognised card layout, and the
+    // text says which in one line without opening the SW console.
+    const pane = document.querySelector('[data-testid*="result"], main') || document.body;
     return {
       status: 'unknown', total: 0, results: [],
+      textSample: clean(pane.innerText).slice(0, 300),
       debugSample: (document.body.innerHTML || '').slice(0, 6000),
     };
   }
