@@ -43,3 +43,9 @@ button.link { flex: 0; background: none; color: #14a800; padding: 0; font-size: 
 .log .warn  { color: #a76b00; }
 .log .error { color: #c0392b; }
 .log .t { color: #999; margin-right: 4px; }
+
+label.check {
+  display: flex; align-items: center; gap: 6px;
+  font-weight: 400; margin: 10px 0 4px;
+}
+label.check input { width: auto; margin: 0; }

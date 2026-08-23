@@ -1,7 +1,20 @@
 /* Popup: edit settings, drive Start/Pause/Resume/Stop, render live log. */
 
 const $ = id => document.getElementById(id);
-const CFG_FIELDS = ['searchUrl', 'githubToken', 'postEndpoint', 'minDelayMs', 'maxDelayMs'];
+
+// Field name -> how to read/write it. Must stay in sync with DEFAULT_CONFIG.
+const CFG_FIELDS = {
+  searchUrl:       'text',
+  contactOutToken: 'text',
+  openaiKey:       'text',
+  openaiModel:     'text',
+  postEndpoint:    'text',
+  minDelayMs:      'int',
+  maxDelayMs:      'int',
+  matchThreshold:  'int',
+  maxCandidates:   'int',
+  skipIfGithub:    'bool',
+};
 
 function send(cmd, extra = {}) {
   return chrome.runtime.sendMessage(Object.assign({ cmd }, extra));
@@ -29,7 +42,10 @@ function renderLog(log) {
   for (const e of log) {
     const div = document.createElement('div');
     div.className = e.level || 'info';
-    div.innerHTML = `<span class="t">${fmtTime(e.t)}</span>`;
+    const t = document.createElement('span');
+    t.className = 't';
+    t.textContent = fmtTime(e.t);
+    div.appendChild(t);
     div.appendChild(document.createTextNode(e.msg));
     box.appendChild(div);
   }
@@ -39,17 +55,26 @@ function renderLog(log) {
 async function refresh() {
   const r = await send('getState');
   if (!r) return;
-  if (r.config) for (const f of CFG_FIELDS) if (r.config[f] != null && $(f)) $(f).value = r.config[f];
+  if (r.config) {
+    for (const [f, kind] of Object.entries(CFG_FIELDS)) {
+      const el = $(f);
+      if (!el || r.config[f] == null) continue;
+      if (kind === 'bool') el.checked = !!r.config[f];
+      else el.value = r.config[f];
+    }
+  }
   if (r.state) renderStatus(r.state);
   if (r.log) renderLog(r.log);
 }
 
 async function saveCfg() {
   const config = {};
-  for (const f of CFG_FIELDS) {
-    let v = $(f).value;
-    if (f === 'minDelayMs' || f === 'maxDelayMs') v = parseInt(v, 10) || 0;
-    config[f] = v;
+  for (const [f, kind] of Object.entries(CFG_FIELDS)) {
+    const el = $(f);
+    if (!el) continue;
+    if (kind === 'bool') config[f] = el.checked;
+    else if (kind === 'int') config[f] = parseInt(el.value, 10) || 0;
+    else config[f] = el.value;
   }
   await send('saveConfig', { config });
   $('save').textContent = 'Saved ✓';
@@ -64,7 +89,7 @@ $('stop').onclick = () => send('stop');
 $('clear').onclick = () => send('clearLog');
 
 chrome.runtime.onMessage.addListener(msg => {
-  if (msg && msg.type === 'tick') { if (msg.state) renderStatus(msg.state); refresh(); }
+  if (msg && msg.type === 'tick') refresh();
 });
 
 refresh();

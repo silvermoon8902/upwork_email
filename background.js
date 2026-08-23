@@ -1,20 +1,26 @@
 /* ============================================================================
- * Upwork → GitHub Email Harvester — background service worker (orchestrator)
+ * Upwork → ContactOut Email Harvester — background service worker (orchestrator)
  *
  * Flow:
  *   1. Take the saved search URL; start page = its `page` param (default 1).
  *   2. Navigate a reusable search tab to that page; scrape candidate ~ids + names.
  *   3. For each candidate: open the profile in a real, visible tab; scrape name,
- *      job success, badge, hourly rate, total earning, and the GitHub avatar's
- *      numeric id from "Linked accounts".
- *   4. Resolve GitHub: api.github.com/user/<id> -> login + public email.
- *      If no public email -> dig commit author emails from public events / repos,
- *      filtering out *noreply.github.com.
- *   5. If a real email is found -> POST the payload to the sink (Apps Script).
- *   6. Auto-advance pages until a page yields no candidates.
+ *      country, title, education, skills, job success, badge, rate, earnings,
+ *      and whether a GitHub account is linked.
+ *   4. Skip anyone with a linked GitHub account (config: skipIfGithub) — that
+ *      segment is handled elsewhere.
+ *   5. ContactOut search on FIRST NAME ONLY ("Zyad K." -> "Zyad"), narrowed by
+ *      education / country / title, then post-filtered on the last initial.
+ *   6. Match: school overlap first (free), model adjudication otherwise.
+ *   7. Above the confidence threshold -> reveal the email and POST to the sink.
+ *   8. Auto-advance pages until a page yields no candidates.
  *
  * Start / Pause / Resume. Captcha auto-pauses (solve in the tab, then Resume).
  * ==========================================================================*/
+
+import { coSearch, coEmail } from './contactout.js';
+import { deterministicMatch, aiMatch } from './matcher.js';
+import { shouldPause } from './errors.js';
 
 const STORE = { config: 'hv_config', state: 'hv_state', log: 'hv_log' };
 
@@ -23,10 +29,15 @@ const SKIP_COUNTRIES = ['india', 'pakistan'];
 
 const DEFAULT_CONFIG = {
   searchUrl: '',
-  githubToken: '',
+  contactOutToken: '',
+  openaiKey: '',
+  openaiModel: 'gpt-4o',
   postEndpoint: 'https://script.google.com/macros/s/AKfycbwG_SXJPo_dn0FJQchDxGJOgYtNqgnsk98drSgRJfxhz3BS3RgjVcY-g2b3OyonhqwecQ/exec',
   minDelayMs: 4000,
-  maxDelayMs: 10000
+  maxDelayMs: 10000,
+  matchThreshold: 75,   // reject matches the matcher scores below this
+  maxCandidates: 8,     // ContactOut results considered per freelancer
+  skipIfGithub: true    // the target segment is freelancers WITHOUT a GitHub link
 };
 
 // In-memory mirror of the run state (also persisted so Resume survives SW death).
@@ -107,11 +118,28 @@ function parsePage(url) {
 function withPage(url, page) {
   const u = new URL(url); u.searchParams.set('page', String(page)); return u.toString();
 }
-function isNoreply(email) {
-  return /noreply\.github\.com$/i.test(email || '');
+
+// "Zyad K." -> { firstName: 'Zyad', lastInitial: 'K' }. The search keyword is the
+// first name alone; the initial is only ever used to filter results afterwards.
+function splitName(display) {
+  const parts = (display || '').trim().split(/\s+/).filter(Boolean);
+  const firstName = (parts[0] || '').replace(/[^\p{L}\p{M}'-]/gu, '');
+  let lastInitial = '';
+  if (parts.length > 1) {
+    const m = parts[parts.length - 1].match(/\p{L}/u);
+    if (m) lastInitial = m[0].toUpperCase();
+  }
+  return { firstName, lastInitial };
 }
 
+// Resolves as soon as the tab is complete, including when it already was —
+// registering the listener after navigation used to mean waiting out the timeout.
 async function waitForLoad(tabId, timeout = 25000) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === 'complete') return;
+  } catch { return; }
+
   return new Promise(resolve => {
     let done = false;
     const finish = () => {
@@ -125,12 +153,8 @@ async function waitForLoad(tabId, timeout = 25000) {
 }
 
 async function runInTab(tabId, func) {
-  try {
-    const [res] = await chrome.scripting.executeScript({ target: { tabId }, func });
-    return res ? res.result : null;
-  } catch (e) {
-    return { error: String(e) };
-  }
+  const [res] = await chrome.scripting.executeScript({ target: { tabId }, func });
+  return res ? res.result : null;
 }
 
 async function closeTab(tabId) {
@@ -168,14 +192,29 @@ function scrapeSearchPage() {
 }
 
 function scrapeProfile() {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+
+  // Find the container of the section whose heading matches `re`.
+  const sectionByHeading = re => {
+    const heads = document.querySelectorAll('h2, h3, h4, [data-qa$="-title"], .air3-card-section h4');
+    for (const h of heads) {
+      if (re.test(clean(h.textContent))) return h.closest('section, .air3-card-section, div') || h.parentElement;
+    }
+    return null;
+  };
+
   const txt = document.body ? document.body.innerText : '';
   const blocked = /Pardon Our Interruption|Verifying you are human|Just a moment|verify you are human/i.test(txt)
     || !!document.querySelector('#px-captcha, iframe[src*="captcha"], iframe[title*="challenge"]');
-  if (blocked) return { blocked: true };
+  if (blocked) return { blocked: true, url: location.href };
 
   let name = '';
   const nameEl = document.querySelector('h1[itemprop="name"], h2[itemprop="name"], [itemprop="name"]');
-  if (nameEl) name = nameEl.textContent.replace(/\s+/g, ' ').trim();
+  if (nameEl) name = clean(nameEl.textContent);
+
+  let title = '';
+  const titleEl = document.querySelector('[data-qa="freelancer-title"], h2[data-qa="title"], .air3-card-section h2');
+  if (titleEl) title = clean(titleEl.textContent);
 
   let hourlyRate = '';
   const rm = txt.match(/\$\s?[\d,.]+\s*\/\s*hr/i);
@@ -198,23 +237,45 @@ function scrapeProfile() {
 
   let country = '';
   const cEl = document.querySelector('[itemprop="country-name"]');
-  if (cEl) country = cEl.textContent.replace(/\s+/g, ' ').trim();
+  if (cEl) country = clean(cEl.textContent);
 
-  let github = null;
-  const linked = document.querySelector('[data-qa="linked-accounts"]') || document;
-  const titleEls = linked.querySelectorAll('.title, span');
-  for (const t of titleEls) {
-    if (!/^\s*github\s*$/i.test(t.textContent)) continue;
-    const container = t.closest('.air3-grid-container') || t.parentElement;
-    const img = container && container.querySelector('img');
-    let numericId = null;
-    if (img && img.src) { const mm = img.src.match(/\/u\/(\d+)/); if (mm) numericId = mm[1]; }
-    const userEl = container && container.querySelector('.username');
-    github = { numericId, username: userEl ? userEl.textContent.trim() : '' };
-    break;
+  // Education: school lines are the ones without a year range or degree prefix.
+  const education = [];
+  const eduSec = document.querySelector('[data-qa="education"]') || sectionByHeading(/^education$/i);
+  if (eduSec) {
+    const lines = (eduSec.innerText || '').split('\n').map(clean)
+      .filter(l => l && !/^education$/i.test(l));
+    let pending = null;
+    for (const line of lines) {
+      const isDetail = /\b(19|20)\d{2}\b/.test(line)
+        || /^(bachelor|master|associate|doctor|ph\.?d|b\.?s|m\.?s|b\.?a|m\.?a|mba|bsc|msc|diploma|certificate)/i.test(line);
+      if (isDetail) { if (pending) pending.detail = line; }
+      else { pending = { school: line, detail: '' }; education.push(pending); }
+    }
   }
 
-  return { blocked: false, name, country, hourlyRate, jss, badge, earning, github, url: location.href };
+  const skills = [];
+  const seenSkill = new Set();
+  document.querySelectorAll('[data-qa="skill"], .air3-token, .skill-name, [data-test="Skill"]').forEach(el => {
+    const s = clean(el.textContent);
+    if (s && s.length < 40 && !seenSkill.has(s.toLowerCase())) { seenSkill.add(s.toLowerCase()); skills.push(s); }
+  });
+
+  // Presence check only, and scoped to the linked-accounts block — searching the
+  // whole document for a span reading "github" matches skill tags and portfolio text.
+  let hasGithub = false;
+  const linked = document.querySelector('[data-qa="linked-accounts"]') || sectionByHeading(/^linked accounts$/i);
+  if (linked) {
+    for (const t of linked.querySelectorAll('.title, span, a')) {
+      if (/^\s*github\s*$/i.test(t.textContent)) { hasGithub = true; break; }
+    }
+    if (!hasGithub && linked.querySelector('a[href*="github.com"]')) hasGithub = true;
+  }
+
+  return {
+    blocked: false, name, title, country, hourlyRate, jss, badge, earning,
+    education, skills: skills.slice(0, 15), hasGithub, url: location.href
+  };
 }
 
 // Injected: scroll the page down then back up to mimic a real user before scraping.
@@ -225,65 +286,6 @@ async function humanScrollFn() {
   for (let i = 1; i <= steps; i++) { window.scrollTo(0, (h() / steps) * i); await sleep(220 + Math.random() * 380); }
   await sleep(400);
   for (let i = steps; i >= 0; i--) { window.scrollTo(0, (h() / steps) * i); await sleep(180 + Math.random() * 260); }
-}
-
-/* ------------------------------ GitHub API ------------------------------ */
-
-async function ghGet(url, token) {
-  const headers = { 'Accept': 'application/vnd.github+json' };
-  if (token) headers['Authorization'] = 'Bearer ' + token;
-  const res = await fetch(url, { headers });
-  if (res.status === 403 && res.headers.get('x-ratelimit-remaining') === '0') {
-    throw new Error('github-rate-limited');
-  }
-  if (!res.ok) throw new Error('github ' + res.status);
-  return res.json();
-}
-
-async function resolveGithub(numericId, token) {
-  const u = await ghGet('https://api.github.com/user/' + numericId, token);
-  return { login: u.login, name: u.name, email: u.email, html_url: u.html_url };
-}
-
-function topEmail(counts) {
-  let best = '', n = -1;
-  for (const k in counts) if (counts[k] > n) { n = counts[k]; best = k; }
-  return best;
-}
-
-async function findCommitEmail(login, token) {
-  // 1) Public events (one call, usually enough).
-  try {
-    const ev = await ghGet(`https://api.github.com/users/${login}/events/public?per_page=100`, token);
-    const counts = {};
-    if (Array.isArray(ev)) for (const e of ev) {
-      if (e.type === 'PushEvent' && e.payload && e.payload.commits) {
-        for (const c of e.payload.commits) {
-          const em = c.author && c.author.email;
-          if (em && !isNoreply(em)) counts[em] = (counts[em] || 0) + 1;
-        }
-      }
-    }
-    const best = topEmail(counts);
-    if (best) return best;
-  } catch (e) { if (String(e).includes('rate-limited')) throw e; }
-
-  // 2) Fallback: recent owned repos -> commits by this author.
-  try {
-    const repos = await ghGet(`https://api.github.com/users/${login}/repos?sort=pushed&per_page=5&type=owner`, token);
-    if (Array.isArray(repos)) for (const r of repos) {
-      if (r.fork) continue;
-      try {
-        const commits = await ghGet(`https://api.github.com/repos/${login}/${r.name}/commits?author=${login}&per_page=10`, token);
-        if (Array.isArray(commits)) for (const c of commits) {
-          const em = c.commit && c.commit.author && c.commit.author.email;
-          if (em && !isNoreply(em)) return em;
-        }
-      } catch (e) { if (String(e).includes('rate-limited')) throw e; }
-    }
-  } catch (e) { if (String(e).includes('rate-limited')) throw e; }
-
-  return '';
 }
 
 /* -------------------------------- sink ---------------------------------- */
@@ -327,27 +329,40 @@ async function ensureSearchTab(url) {
   return tab.id;
 }
 
+// `status` distinguishes a genuinely empty page from a failed scrape — conflating
+// them used to end the sweep early and log it as success.
 async function loadPage(cfg, page) {
   const url = withPage(cfg.searchUrl, page);
   await pushLog(`Loading search page ${page}…`);
-  const tabId = await ensureSearchTab(url);
-  await waitForLoad(tabId);
-  await sleep(3500); // SPA settle
-  const res = await runInTab(tabId, scrapeSearchPage);
-  if (!res || res.error) { await pushLog('Search scrape error: ' + (res && res.error), 'error'); return { blocked: false, candidates: [] }; }
-  if (res.blocked) return { blocked: true, candidates: [] };
+
+  let res;
+  try {
+    const tabId = await ensureSearchTab(url);
+    await waitForLoad(tabId);
+    await sleep(3500); // SPA settle
+    res = await runInTab(tabId, scrapeSearchPage);
+  } catch (e) {
+    await pushLog('Search page injection failed: ' + e, 'error');
+    return { status: 'error', candidates: [] };
+  }
+
+  if (!res) return { status: 'error', candidates: [] };
+  if (res.blocked) return { status: 'blocked', candidates: [] };
   await pushLog(`Page ${page}: found ${res.candidates.length} candidates.`);
-  return { blocked: false, candidates: res.candidates };
+  return { status: res.candidates.length ? 'ok' : 'empty', candidates: res.candidates };
 }
 
+// Retries until the GitHub/linked-accounts block has actually rendered — keying
+// on `name` alone returned on first paint and never gave late sections a chance.
 async function scrapeProfileWithRetry(tabId) {
+  let last = null;
   for (let i = 0; i < 4; i++) {
-    const r = await runInTab(tabId, scrapeProfile);
-    if (r && r.blocked) return r;
-    if (r && (r.name || r.github)) return r;
+    last = await runInTab(tabId, scrapeProfile);
+    if (last && last.blocked) return last;
+    if (last && last.name && (last.education.length || last.skills.length)) return last;
     await sleep(2000);
   }
-  return await runInTab(tabId, scrapeProfile);
+  return last;
 }
 
 function captchaPause() {
@@ -356,6 +371,14 @@ function captchaPause() {
   setBadge(true);
 }
 
+async function pauseForQuota(msg) {
+  await pushLog(`⚠️ ${msg} — pausing. Fix it, then click Resume.`, 'warn');
+  S.status = 'paused';
+  setBadge(false);
+}
+
+/* Returns true when the candidate was handled (advance the queue), false when
+ * the run paused mid-candidate and it must be retried on Resume. */
 async function processCandidate(cfg, cand) {
   S.current = cand.name || cand.id;
   await pushLog(`▶ ${cand.name || cand.id} — opening profile…`);
@@ -364,8 +387,18 @@ async function processCandidate(cfg, cand) {
   let tabId = S.profileTabId;
   if (tabId != null) {
     S.profileTabId = null;
-    try { await chrome.tabs.get(tabId); await waitForLoad(tabId, 8000); }
-    catch { tabId = null; }
+    try {
+      await chrome.tabs.get(tabId);
+      await waitForLoad(tabId, 8000);
+      // Solving a captcha can land the tab somewhere else entirely; scraping it
+      // then reads the wrong page and silently drops the candidate.
+      const t = await chrome.tabs.get(tabId);
+      if (!t.url || !t.url.includes(cand.id)) {
+        await chrome.tabs.update(tabId, { url: cand.profileUrl });
+        await waitForLoad(tabId);
+        await sleep(3000);
+      }
+    } catch { tabId = null; }
   }
   if (tabId == null) {
     tabId = await createProfileTab(cand.profileUrl);
@@ -378,67 +411,110 @@ async function processCandidate(cfg, cand) {
   let keepOpen = false;
   try {
     const data = await scrapeProfileWithRetry(tabId);
-    if (data && data.blocked) {
+    if (!data) {
+      await pushLog(`— ${cand.name || cand.id}: profile scrape failed.`, 'error');
+      return true;
+    }
+    if (data.blocked) {
       await pushLog('⚠️ CAPTCHA on profile — solve it in the open tab, then click Resume.', 'warn');
       keepOpen = true; S.profileTabId = tabId; captchaPause();
-      return;
+      return false;
     }
 
-    const name = (data && data.name) || cand.name || '';
-    const country = (data && data.country) || '';
-    if (country && SKIP_COUNTRIES.indexOf(country.toLowerCase()) !== -1) {
-      await pushLog(`⏭ ${name || cand.id}: ${country} — skipped.`);
-      return;
+    const display = data.name || cand.name || '';
+    const label = display || cand.id;
+
+    if (data.country && SKIP_COUNTRIES.indexOf(data.country.toLowerCase()) !== -1) {
+      await pushLog(`⏭ ${label}: ${data.country} — skipped.`);
+      return true;
+    }
+    if (cfg.skipIfGithub && data.hasGithub) {
+      await pushLog(`⏭ ${label}: has a linked GitHub account — skipped.`);
+      return true;
     }
 
-    if (!data || !data.github || !data.github.numericId) {
-      await pushLog(`— ${name || cand.id}: no GitHub linked account.`);
-      return;
+    const { firstName, lastInitial } = splitName(display);
+    if (!firstName) {
+      await pushLog(`— ${label}: no usable first name.`);
+      return true;
+    }
+    // First name alone is far too broad without something to narrow on.
+    if (!data.education.length && !data.title) {
+      await pushLog(`— ${label}: no education or title to search on — skipped.`);
+      return true;
     }
 
-    let gh;
-    try {
-      gh = await resolveGithub(data.github.numericId, cfg.githubToken);
-    } catch (e) {
-      if (String(e).includes('rate-limited')) {
-        await pushLog('⚠️ GitHub rate limit hit — pausing. Add/refresh a PAT, then Resume.', 'warn');
-        keepOpen = true; S.profileTabId = tabId; S.status = 'paused'; setBadge(false);
-        return;
-      }
-      await pushLog(`GitHub resolve failed for ${name}: ${e}`, 'error');
-      return;
+    const profile = {
+      firstName, lastInitial,
+      country: data.country,
+      title: data.title,
+      education: data.education,
+      skills: data.skills,
+    };
+
+    const { all, kept } = await coSearch(cfg, profile);
+    if (!all.length) {
+      await pushLog(`— ${label}: no ContactOut results for "${firstName}".`);
+      return true;
+    }
+    if (!kept.length) {
+      await pushLog(`— ${label}: ${all.length} results, none with surname "${lastInitial}".`);
+      return true;
     }
 
-    const githubLink = gh.html_url || ('https://github.com/' + gh.login);
-    let email = (gh.email && !isNoreply(gh.email)) ? gh.email : '';
+    const pool = kept.slice(0, cfg.maxCandidates);
+    if (kept.length > pool.length) {
+      await pushLog(`  ${label}: ${kept.length} survivors, evaluating first ${pool.length}.`, 'warn');
+    }
+
+    let verdict = deterministicMatch(profile, pool);
+    if (!verdict) verdict = await aiMatch(cfg, profile, pool);
+
+    if (!verdict || verdict.index < 0 || !pool[verdict.index]) {
+      await pushLog(`— ${label}: no confident match (${(verdict && verdict.reason) || 'no matcher configured'}).`);
+      return true;
+    }
+    if (verdict.confidence < cfg.matchThreshold) {
+      await pushLog(`— ${label}: best match ${verdict.confidence}% < ${cfg.matchThreshold}% — rejected.`);
+      return true;
+    }
+
+    const winner = pool[verdict.index];
+    const email = await coEmail(cfg, winner);
     if (!email) {
-      try { email = await findCommitEmail(gh.login, cfg.githubToken); }
-      catch (e) {
-        if (String(e).includes('rate-limited')) {
-          await pushLog('⚠️ GitHub rate limit hit — pausing. Add/refresh a PAT, then Resume.', 'warn');
-          keepOpen = true; S.profileTabId = tabId; S.status = 'paused'; setBadge(false);
-          return;
-        }
-      }
+      await pushLog(`— ${label} → ${winner.fullName}: matched, but no email available.`);
+      return true;
     }
 
-    if (email && !isNoreply(email)) {
-      const payload = {
-        upwork_name: name,
-        upwork_profile_link: cand.profileUrl,
-        github_profile_link: githubLink,
-        email_address: email,
-        job_success_score: (data && data.jss) || '',
-        badge: (data && data.badge) || '',
-        hourly_rate: (data && data.hourlyRate) || '',
-        total_earning: (data && data.earning) || ''
-      };
-      const ok = await postToSink(cfg.postEndpoint, payload);
-      S.emails++;
-      await pushLog(`✅ ${name} → ${email}  (${githubLink})${ok ? '' : '  [POST failed]'}`, 'ok');
-    } else {
-      await pushLog(`— ${name} (${gh.login}): no public/commit email found.`);
+    const payload = {
+      upwork_name: display,
+      upwork_profile_link: cand.profileUrl,
+      linkedin_profile_link: winner.linkedin,
+      email_address: email,
+      full_name: winner.fullName,
+      education: data.education.map(e => e.school).join('; '),
+      match_confidence: String(verdict.confidence),
+      match_source: verdict.source,
+      job_success_score: data.jss,
+      badge: data.badge,
+      hourly_rate: data.hourlyRate,
+      total_earning: data.earning
+    };
+    const ok = await postToSink(cfg.postEndpoint, payload);
+    if (ok) S.emails++;
+    await pushLog(
+      `✅ ${display} → ${email}  (${winner.fullName}, ${verdict.confidence}% via ${verdict.source})${ok ? '' : '  [POST failed]'}`,
+      'ok');
+    return true;
+
+  } catch (e) {
+    if (shouldPause(e)) {
+      keepOpen = true; S.profileTabId = tabId;
+      await pauseForQuota(String(e.message || e));
+      return false;
     }
+    await pushLog(`Error on ${cand.name || cand.id}: ${e}`, 'error');
+    return true;
   } finally {
     if (!keepOpen) await closeTab(tabId);
   }
@@ -454,12 +530,17 @@ async function drive() {
       if (S.queueIndex >= S.queue.length) {
         const res = await loadPage(cfg, S.page);
         if (S.status !== 'running') break;
-        if (res.blocked) {
+        if (res.status === 'blocked') {
           await pushLog('⚠️ CAPTCHA on search page — solve it, then click Resume.', 'warn');
           captchaPause();
           break;
         }
-        if (res.candidates.length === 0) {
+        if (res.status === 'error') {
+          // Not the same as an empty page — stay resumable on this page.
+          await pauseForQuota('Search page could not be read');
+          break;
+        }
+        if (res.status === 'empty') {
           await pushLog('No candidates on this page — sweep complete.', 'ok');
           S.status = 'idle'; S.current = ''; setBadge(false); break;
         }
@@ -468,11 +549,13 @@ async function drive() {
       }
 
       const cand = S.queue[S.queueIndex];
-      await processCandidate(cfg, cand);
-      if (S.status !== 'running') { await persistState(); break; }
-
-      S.processed++; S.queueIndex++;
+      // `handled` — not the run status — decides whether the queue advances, so
+      // pausing after a finished candidate no longer re-runs it on Resume.
+      const handled = await processCandidate(cfg, cand);
+      if (handled) { S.processed++; S.queueIndex++; }
       await persistState();
+      if (S.status !== 'running') break;
+
       await sleep(randDelay(cfg));
       if (S.status !== 'running') break;
     }
@@ -490,6 +573,12 @@ async function drive() {
 async function cmdStart() {
   const cfg = await loadConfig();
   if (!cfg.searchUrl) { await pushLog('Set a search URL first.', 'error'); return; }
+  if (!cfg.contactOutToken) { await pushLog('Set a ContactOut token first.', 'error'); return; }
+
+  // Orphaned tabs from a previous run would otherwise pile up.
+  if (S.searchTabId != null) await closeTab(S.searchTabId);
+  if (S.profileTabId != null) await closeTab(S.profileTabId);
+
   S = {
     status: 'running', captcha: false,
     page: parsePage(cfg.searchUrl),
@@ -516,6 +605,8 @@ async function cmdResume() {
 
 async function cmdStop() {
   S.status = 'idle'; S.captcha = false; S.queue = []; S.queueIndex = 0; S.current = '';
+  if (S.searchTabId != null) { await closeTab(S.searchTabId); S.searchTabId = null; }
+  if (S.profileTabId != null) { await closeTab(S.profileTabId); S.profileTabId = null; }
   setBadge(false); await pushLog('Stopped.', 'warn'); await persistState();
 }
 

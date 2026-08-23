@@ -5,15 +5,21 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <h1>Upwork → GitHub Harvester</h1>
+  <h1>Upwork → ContactOut Harvester</h1>
 
   <details id="cfg" open>
     <summary>Settings</summary>
     <label>Search URL (start page taken from its <code>page=</code> param)</label>
     <textarea id="searchUrl" rows="3" placeholder="https://www.upwork.com/nx/search/talent/?q=full%20stack%20developer&...&page=20"></textarea>
 
-    <label>GitHub Personal Access Token</label>
-    <input id="githubToken" type="password" placeholder="ghp_… (read:user, user:email)">
+    <label>ContactOut API token</label>
+    <input id="contactOutToken" type="password" placeholder="required">
+
+    <label>OpenAI API key (matcher)</label>
+    <input id="openaiKey" type="password" placeholder="sk-… (optional — school-match still works without it)">
+
+    <label>OpenAI model</label>
+    <input id="openaiModel" type="text" placeholder="gpt-4o">
 
     <label>POST endpoint (Apps Script /exec)</label>
     <input id="postEndpoint" type="text">
@@ -22,6 +28,17 @@
       <div><label>Min delay (ms)</label><input id="minDelayMs" type="number" min="0"></div>
       <div><label>Max delay (ms)</label><input id="maxDelayMs" type="number" min="0"></div>
     </div>
+
+    <div class="row">
+      <div><label>Match threshold (%)</label><input id="matchThreshold" type="number" min="0" max="100"></div>
+      <div><label>Max results / profile</label><input id="maxCandidates" type="number" min="1"></div>
+    </div>
+
+    <label class="check">
+      <input id="skipIfGithub" type="checkbox">
+      Skip freelancers who have a linked GitHub account
+    </label>
+
     <button id="save" class="secondary">Save settings</button>
   </details>
 
