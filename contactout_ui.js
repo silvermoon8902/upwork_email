@@ -17,6 +17,18 @@
 
 export const CO_SEARCH_URL = 'https://contactout.com/dashboard/search';
 
+/* The dashboard drives its search off query params — running one by hand lands on
+ *   /dashboard/search?nm=Edwin&page=1&school=Full%20Sail%20University
+ * so the query can be handed over in the URL instead of typed into react-select.
+ * `nm` is the Name field, `school` is School/Degree. */
+export function buildSearchUrl(firstName, school, page) {
+  const u = new URL(CO_SEARCH_URL);
+  u.searchParams.set('nm', firstName);
+  u.searchParams.set('page', String(page || 1));
+  if (school) u.searchParams.set('school', school);
+  return u.toString();
+}
+
 /* --------------------------- injected: fill form ------------------------- */
 
 /** args: { firstName, schools: string[] } -> { ok, error?, schoolsApplied } */
@@ -91,9 +103,22 @@ export async function fillSearchFormFn(query) {
     if (await pick('School/Degree', school)) schoolsApplied++;
   }
 
-  const searchBtn = document.querySelector('button[type="submit"]')
-    || byText('button', /^search$/i);
+  // The left nav also has a "Search" item and it comes first in the DOM, so
+  // never take the first match — the form's submit is the last one, and it must
+  // share a near ancestor with the Name field.
+  const searchBtn = Array.from(document.querySelectorAll('button'))
+    .filter(b => /^search$/i.test(norm(b.textContent)))
+    .filter(b => {
+      let el = b;
+      for (let i = 0; i < 6 && el.parentElement; i++) {
+        el = el.parentElement;
+        if (el.contains(nameInput)) return true;
+      }
+      return false;
+    })
+    .pop();
   if (!searchBtn) return { ok: false, error: 'search button not found' };
+  if (searchBtn.disabled) return { ok: false, error: 'search button disabled — form did not take the input' };
   searchBtn.click();
 
   return { ok: true, schoolsApplied };
@@ -117,7 +142,7 @@ export async function scrapeResultsFn(max) {
     return null;
   };
 
-  let anchors = [];
+  let anchors = [], preSearch = false;
   for (let i = 0; i < 40; i++) {          // results load async after Search
     await sleep(500);
     const body = clean(document.body.innerText);
@@ -126,10 +151,15 @@ export async function scrapeResultsFn(max) {
     }
     anchors = Array.from(document.querySelectorAll('a[data-testid="linkedin-link"]'));
     if (anchors.length) break;
-    if (/no results|no profiles|0 profiles/i.test(body)) {
+    if (/no results|no profiles found|0 profiles/i.test(body)) {
       return { status: 'empty', total: 0, results: [] };
     }
+    // The dashboard's idle pane. Filters may be filled, but nothing was run —
+    // reporting this as "layout not recognised" hid a search that never fired.
+    preSearch = /let's start searching|find emails and phones for/i.test(body);
   }
+
+  if (!anchors.length && preSearch) return { status: 'not-searched', total: 0, results: [] };
 
   // "1 - 15 of 70 profiles" — how many the name matched before the page cap.
   const totalMatch = clean(document.body.innerText).match(/\d+\s*-\s*\d+\s+of\s+([\d,]+)\s+profiles/i);

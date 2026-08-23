@@ -19,7 +19,7 @@
  * ==========================================================================*/
 
 import {
-  CO_SEARCH_URL, fillSearchFormFn, scrapeResultsFn, revealEmailFn,
+  CO_SEARCH_URL, buildSearchUrl, fillSearchFormFn, scrapeResultsFn, revealEmailFn,
   normalize, filterByLastInitial
 } from './contactout_ui.js';
 import { deterministicMatch, aiMatch } from './matcher.js';
@@ -472,33 +472,51 @@ async function ensureContactOutTab() {
   return tab.id;
 }
 
-async function coSearchViaTab(cfg, profile) {
+// One query: hand it over in the URL, and only fall back to driving the form if
+// the dashboard loads that URL without actually running the search.
+async function coSearchOnce(cfg, profile, school) {
   const tabId = await ensureContactOutTab();
 
-  // Reload rather than trusting leftover React state from the previous candidate.
-  await chrome.tabs.update(tabId, { url: CO_SEARCH_URL });
+  await chrome.tabs.update(tabId, { url: buildSearchUrl(profile.firstName, school) });
   await waitForLoad(tabId);
-  await sleep(3500);
+  await sleep(3000);
 
-  const filled = await runInTab(tabId, fillSearchFormFn, {
-    firstName: profile.firstName,
-    schools: profile.education.map(e => e.school).filter(Boolean),
-  });
-  if (!filled || !filled.ok) {
-    throw new PauseRun(`ContactOut form could not be filled (${(filled && filled.error) || 'no result'}) — is the dashboard logged in?`);
-  }
-  if (!filled.schoolsApplied && profile.education.length) {
-    await pushLog(`  no School/Degree option matched "${profile.education[0].school}" — searching on name alone.`, 'warn');
+  let out = await runInTab(tabId, scrapeResultsFn, cfg.maxCandidates);
+
+  if (out && out.status === 'not-searched') {
+    await pushLog('  ContactOut ignored the URL query — pressing Search instead.', 'warn');
+    const filled = await runInTab(tabId, fillSearchFormFn, {
+      firstName: profile.firstName,
+      schools: school ? [school] : [],
+    });
+    if (!filled || !filled.ok) {
+      throw new PauseRun(`ContactOut search could not be submitted (${(filled && filled.error) || 'no result'}) — is the dashboard logged in?`);
+    }
+    out = await runInTab(tabId, scrapeResultsFn, cfg.maxCandidates);
   }
 
-  const out = await runInTab(tabId, scrapeResultsFn, cfg.maxCandidates);
   if (!out) throw new Error('ContactOut results scrape returned nothing');
   if (out.status === 'quota') throw new PauseRun('ContactOut credits exhausted or upgrade required');
+  if (out.status === 'not-searched') throw new PauseRun('ContactOut never ran the search');
   if (out.status === 'unknown') {
     // Card layout changed — surface a sample rather than guessing at selectors.
     await pushLog('ContactOut results not recognised — see the SW console for a DOM sample.', 'error');
     console.log('[ContactOut debugSample]', out.debugSample);
     throw new PauseRun('ContactOut results DOM not recognised');
+  }
+  return out;
+}
+
+async function coSearchViaTab(cfg, profile) {
+  const school = (profile.education[0] || {}).school || '';
+
+  let out = await coSearchOnce(cfg, profile, school);
+
+  // ContactOut's school taxonomy won't always match Upwork's wording, and a
+  // school that matches nothing filters the real person out entirely.
+  if (school && out.status === 'empty') {
+    await pushLog(`  no results with school "${school}" — retrying on name alone.`, 'warn');
+    out = await coSearchOnce(cfg, profile, '');
   }
 
   // ContactOut caps the page at 15; `total` is how many the name really matched.

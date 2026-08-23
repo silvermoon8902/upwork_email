@@ -151,8 +151,22 @@ reads two dates out of `.work-history-section`: the latest *ended* contract and 
 
 ### Driving the ContactOut dashboard
 
-There is no API token — `coSearchViaTab` fills the real search form in a reused background
-tab (`S.coTabId`), which the user must be logged into. Three things there are load-bearing:
+There is no API token — the dashboard is driven in a reused background tab (`S.coTabId`), which
+the user must be logged into.
+
+**The query goes in the URL, not the form.** Running a search by hand lands on
+`/dashboard/search?nm=Edwin&page=1&school=Full%20Sail%20University`, so `buildSearchUrl` hands
+`nm` (Name) and `school` (School/Degree) over directly and skips react-select entirely.
+`fillSearchFormFn` is only a **fallback**, used when the dashboard loads that URL but stays on
+its idle pane — `scrapeResultsFn` reports that as `not-searched`, which is deliberately distinct
+from `unknown` (layout changed). Conflating them made a search that never fired look like a
+selector problem.
+
+`coSearchViaTab` retries **without** the school when a school-filtered search returns `empty`:
+ContactOut's school taxonomy doesn't always match Upwork's wording, and a school that matches
+nothing filters out the very person being looked for.
+
+When the form fallback does run, three things in it are load-bearing:
 
 - **React ignores `el.value = x`.** `fillSearchFormFn` writes through
   `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set` and then dispatches
@@ -162,6 +176,9 @@ tab (`S.coTabId`), which the user must be logged into. Three things there are lo
   by its `<label>` text instead. Name is the one exception — `input[name="nm"]` is stable.
 - **react-select commits on `mousedown`, not `click`,** and its menu loads async, so `pick()`
   types, polls for `.contactout-select__option`, then fires mousedown/mouseup/click.
+- **The left nav has its own "Search" item and it comes first in the DOM.** The submit button is
+  selected as the *last* button labelled "Search" that shares a near ancestor with
+  `input[name="nm"]` — taking the first match clicked the nav and the search never ran.
 
 Each search reloads the tab *and* clicks "Clear all" — School/Degree is a multi-select, so
 without the reset every candidate inherits the previous one's schools.
