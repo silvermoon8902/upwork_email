@@ -639,12 +639,21 @@ async function coSearchViaTab(cfg, profile) {
   }
   const location = profile.country || '';
 
-  // School is the narrowing signal; job title is deliberately not sent. Upwork
-  // headlines are marketing copy ("Expert Logo Designer | Modern Minimalist…"),
-  // not job titles, so they match nothing in ContactOut's taxonomy.
+  /* School alone is the strongest query available — "Zehra" + Fashion Institute
+   * of Technology returns a single profile out of 1711 by name.
+   *
+   * Location is deliberately NOT paired with it. Upwork's country is where the
+   * freelancer lives, which routinely differs from the location on their
+   * LinkedIn — that same Zehra is listed USA on Upwork and Istanbul on LinkedIn
+   * — so combining the two returns zero and drops the search back to a useless
+   * name+country sweep. Location is only a fallback when there is no school.
+   *
+   * Job title is not sent either: Upwork headlines are marketing copy ("Expert
+   * Logo Designer | Modern Minimalist…"), not taxonomy job titles. */
   const tiers = [];
-  if (school) tiers.push({ school, location });
-  tiers.push({ location });
+  if (school) tiers.push({ school });
+  if (location) tiers.push({ location });
+  if (!tiers.length) tiers.push({});
 
   let out = null;
   for (const filters of tiers) {
@@ -653,21 +662,14 @@ async function coSearchViaTab(cfg, profile) {
     await pushLog('  no results at that filter level — widening.', 'warn');
   }
 
-  // Still hopeless on the widest useful tier. The last initial is the only
-  // signal left, and it only costs a page load in cases already being skipped.
-  if (out.total > MAX_SEARCH_TOTAL && profile.lastInitial) {
-    await pushLog(`  ${out.total} matches — retrying with surname initial "${profile.lastInitial}".`, 'warn');
-    const narrowed = await coSearchOnce(cfg, profile, {
-      ...tiers[0], surnameInitial: profile.lastInitial
-    });
+  // Only once the school has proved too broad on its own is location worth its
+  // risk of excluding the right person — the alternative here is skipping.
+  if (out.total > MAX_SEARCH_TOTAL && school && location) {
+    await pushLog(`  ${out.total} matches on school alone — adding location "${location}".`, 'warn');
+    const narrowed = await coSearchOnce(cfg, profile, { school, location });
     if (narrowed.status === 'ok' && narrowed.total && narrowed.total <= MAX_SEARCH_TOTAL) {
       out = narrowed;
     }
-  }
-
-  const read = (out.results || []).length;
-  if (out.total > read) {
-    await pushLog(`  "${profile.firstName}" matched ${out.total} profiles — reading the first ${read}.`, 'warn');
   }
 
   // Past this point the filters plainly aren't biting. Matching a couple of
@@ -675,6 +677,11 @@ async function coSearchViaTab(cfg, profile) {
   // attempt costs an OpenAI call — report it rather than guessing.
   if (out.total > MAX_SEARCH_TOTAL) {
     return { all: [], kept: [], tooBroad: true, total: out.total };
+  }
+
+  const read = (out.results || []).length;
+  if (out.total > read) {
+    await pushLog(`  "${profile.firstName}" matched ${out.total} profiles — reading the first ${read}.`, 'warn');
   }
 
   const all = normalize(out.results || []);

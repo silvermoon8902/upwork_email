@@ -30,9 +30,10 @@ export const CO_SEARCH_URL = 'https://contactout.com/dashboard/search';
 export function buildSearchUrl(firstName, opts) {
   const o = opts || {};
   const u = new URL(CO_SEARCH_URL);
-  // Upwork hides surnames, but appending the initial it *does* expose is the
-  // last narrowing signal available when a first name alone is hopeless.
-  u.searchParams.set('nm', o.surnameInitial ? `${firstName} ${o.surnameInitial}` : firstName);
+  // First name only. Appending Upwork's last initial ("Zehra P") was tried and
+  // returns zero results — `nm` is matched against the whole name, so a bare
+  // initial matches nobody. Don't reintroduce it.
+  u.searchParams.set('nm', firstName);
   u.searchParams.set('page', String(o.page || 1));
   if (o.school) u.searchParams.set('school', o.school);
   if (o.location) u.searchParams.set('location', o.location);
@@ -213,9 +214,15 @@ export async function scrapeResultsFn(max) {
     }
     anchors = Array.from(document.querySelectorAll('a[data-testid="linkedin-link"]'));
     if (anchors.length) break;
-    // ContactOut's zero-results pane offers a LinkedIn search instead of listing
-    // anything, and doesn't always use the words "no results".
-    if (/no results|no profiles found|0 profiles|no matching profiles|go to linkedin search|couldn't find|could not find|try (a )?(different|broader|another)|adjust your (search|filters)|broaden your search/i.test(body)) {
+    // ContactOut's zero-results pane reads "We couldn't find what you're
+    // searching for" — it never says "no results". Two traps here:
+    //   ['’] — these pages use curly apostrophes, and a straight-quote-only
+    //          pattern silently fails to match, pausing the run instead.
+    //   \b0  — without the boundary, "0 profiles" matches "of 80 profiles" and
+    //          calls a full page of results empty.
+    // Only trusted after a couple of seconds: on the first ticks the header can
+    // be present while the cards are still rendering.
+    if (i >= 4 && /no results|no profiles found|\b0 profiles|no matching profiles|go to linkedin search|could ?n['’]?t find|could not find|try (a )?(different|broader|another)|adjust your (search|filters)|broaden your search/i.test(body)) {
       return { status: 'empty', total: 0, results: [] };
     }
     // The dashboard's idle pane. Filters may be filled, but nothing was run —

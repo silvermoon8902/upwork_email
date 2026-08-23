@@ -190,21 +190,22 @@ its idle pane — `scrapeResultsFn` reports that as `not-searched`, which is del
 from `unknown` (layout changed). Conflating them made a search that never fired look like a
 selector problem.
 
-`coSearchViaTab` runs an **escalating ladder**, narrowest first, taking the first tier that
-returns anything: `school+location` → `location`. It widens on `empty` because ContactOut's
-school taxonomy doesn't always match Upwork's wording, and a filter matching nothing excludes
-the very person being looked for.
+**School alone is the query.** `nm=Zehra&school=Fashion Institute of Technology` returns a
+single profile where `nm=Zehra` alone returns 1711. `coSearchViaTab`'s ladder is
+`{school}` → `{location}` → `{}`, taking the first tier that returns anything.
 
-**Job title is deliberately not a search filter.** The param works (`title=`), but Upwork
-headlines are marketing copy — "Expert Logo Designer | Modern Minimalist Logo Design & Brand
-Identity" — not job titles, so they match nothing in ContactOut's taxonomy. `data.title` is
-still scraped, because [matcher.js](matcher.js) uses it as matching evidence.
+Three filters were tried and rejected on evidence — don't reintroduce them:
 
-A first name plus a country is nowhere near sufficient on its own — "Anna" in Ukraine is 53,715
-people, "Jennifer" in the USA is over a million, so **school is the load-bearing filter**. When
-a result is still above `MAX_SEARCH_TOTAL` the **surname initial** is appended to `nm` as a last
-resort (`nm=Jereme B`); that extra page load only happens for candidates that would otherwise be
-skipped.
+- **Location must not be paired with school.** Upwork's country is where the freelancer *lives*;
+  their LinkedIn routinely says somewhere else (the same Zehra is USA on Upwork, Istanbul on
+  LinkedIn). `school+location` returned zero, which sent the ladder down to a useless
+  name+country sweep of 1711. Location is a fallback only when there is no school, plus a
+  narrowing retry when school alone exceeds `MAX_SEARCH_TOTAL`.
+- **Job title.** The param works, but Upwork headlines are marketing copy — "Expert Logo
+  Designer | Modern Minimalist Logo Design & Brand Identity" — not taxonomy job titles.
+  `data.title` is still scraped, because [matcher.js](matcher.js) uses it as evidence.
+- **Surname initial appended to `nm`.** `nm=Zehra P` returns zero; `nm` is matched against the
+  whole name, so a bare initial matches nobody.
 
 Confirmed params: `nm`, `school`, `location`, `title` (all seen rendering as chips in the live
 form).
@@ -266,6 +267,11 @@ ContactOut deploy — **never select on those**. `scrapeResultsFn` anchors on st
   `[data-testid="confidence-level-indicator"][data-tip="Verified"]` is a per-address quality flag.
 - The header reads "1 - 15 of 70 profiles"; the page caps at 15, so `total` is logged whenever
   it exceeds what was read — a common first name silently truncating is worth seeing.
+- The zero-results pane reads "We couldn't find what you're searching for" and pitches the
+  Chrome extension — it never says "no results". Two traps in that pattern: the page uses
+  **curly apostrophes**, so match `['’]`; and `0 profiles` needs a `\b` or it matches
+  "of **80** profiles" and calls a full page empty. The check is also gated on a few polling
+  ticks, since the count header can render before the cards do.
 
 `winner.hasEmail` is checked **after** matching, not before. Filtering email-less cards out of
 the pool first would let a confident match land on the wrong person instead of reporting a dead end.
