@@ -265,8 +265,17 @@ ContactOut deploy — **never select on those**. `scrapeResultsFn` anchors on st
 - Emails are masked (`***@hotmail.com`) until `button.reveal-btn` is clicked, which spends a
   credit. "View phone" shares that class, so the reveal button is matched on its *label*.
   `[data-testid="confidence-level-indicator"][data-tip="Verified"]` is a per-address quality flag.
+- **One `[data-testid="contact-infotext-wrapper"]` per address**, and a card often has several
+  (personal + work). Read the `div[data-for$="-text"]` inside it, **not** the wrapper's own
+  `textContent` — the wrapper also contains tooltip `<style>` blocks and the "Flag as
+  inaccurate" / "Copy" button labels, so its text comes out as
+  `"zehra@agilosoft.com .t65d { color: #fff; … }Flag as …"`. `revealEmailFn` also re-reads after
+  a short settle, because the addresses don't all paint at once.
 - The header reads "1 - 15 of 70 profiles"; the page caps at 15, so `total` is logged whenever
   it exceeds what was read — a common first name silently truncating is worth seeing.
+  **The thousands separator is locale-dependent** — "1 - 20 of 51.447 profiles" is 51,447 — so
+  the pattern accepts `.`/`,`/space and strips every non-digit. Matching only `[\d,]` parsed
+  that as `51` and let a 51k-result search straight past `MAX_SEARCH_TOTAL`.
 - The zero-results pane reads "We couldn't find what you're searching for" and pitches the
   Chrome extension — it never says "no results". Two traps in that pattern: the page uses
   **curly apostrophes**, so match `['’]`; and `0 profiles` needs a `\b` or it matches

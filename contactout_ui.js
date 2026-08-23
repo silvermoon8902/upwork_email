@@ -233,8 +233,14 @@ export async function scrapeResultsFn(max) {
   if (!anchors.length && preSearch) return { status: 'not-searched', total: 0, results: [] };
 
   // "1 - 15 of 70 profiles" — how many the name matched before the page cap.
-  const totalMatch = clean(document.body.innerText).match(/\d+\s*-\s*\d+\s+of\s+([\d,]+)\s+profiles/i);
-  const total = totalMatch ? parseInt(totalMatch[1].replace(/,/g, ''), 10) : anchors.length;
+  // The separator is locale-dependent: "51.447" means 51,447, so accept dots,
+  // commas and spaces and strip every non-digit. Matching only [\d,] read that
+  // as 51 and waved a 51k-result search straight past the breadth guard.
+  const totalMatch = clean(document.body.innerText)
+    .match(/\d[\d.,\s]*\s*-\s*\d[\d.,\s]*\s+of\s+([\d.,\s]+?)\s*profiles/i);
+  const total = totalMatch
+    ? parseInt(totalMatch[1].replace(/\D/g, ''), 10) || anchors.length
+    : anchors.length;
 
   if (!anchors.length) {
     // Carry the visible text too — an unrecognised *state* (some new empty or
@@ -281,9 +287,16 @@ export async function scrapeResultsFn(max) {
       else if (vb === '0 0 12 12') { if (!experience.includes(text)) experience.push(text); }
     });
 
-    // Masked ("***@hotmail.com") until a credit is spent on View email.
+    // Masked ("***@hotmail.com") until a credit is spent on View email. One
+    // wrapper per address; read the div marked data-for="…-text" rather than the
+    // wrapper's text, which also carries tooltip <style> blocks and the "Flag as
+    // inaccurate" / "Copy" button labels.
     const emails = Array.from(card.querySelectorAll('[data-testid="contact-infotext-wrapper"]'))
-      .map(w => clean(w.textContent)).filter(t => t.includes('@'));
+      .map(w => {
+        const el = w.querySelector('div[data-for$="-text"]');
+        return clean(el ? el.textContent : w.textContent);
+      })
+      .filter(t => t.includes('@'));
 
     results.push({
       linkedin,
@@ -321,15 +334,22 @@ export async function revealEmailFn(linkedinHref) {
   }
   if (!card || !card.querySelector('button.reveal-btn')) return { status: 'not-found' };
 
-  // Revealed addresses lose the asterisk mask.
+  // Revealed addresses lose the asterisk mask. One wrapper per address — read
+  // the div marked data-for="…-text", not the wrapper, whose text also contains
+  // tooltip <style> blocks and the "Flag as inaccurate" / "Copy" labels.
   const readEmails = () =>
     Array.from(card.querySelectorAll('[data-testid="contact-infotext-wrapper"]'))
-      .map(w => clean(w.textContent))
+      .map(w => {
+        const el = w.querySelector('div[data-for$="-text"]');
+        return clean(el ? el.textContent : w.textContent);
+      })
       .filter(t => t.includes('@') && !t.includes('*'))
       .map(t => (t.match(FULL) || [])[0])
       .filter(Boolean);
 
-  const already = readEmails();
+  const uniq = arr => Array.from(new Set(arr));
+
+  const already = uniq(readEmails());
   if (already.length) return { status: 'ok', email: already[0], emails: already };
 
   // "View phone" is the same button class — match on the label, not the class.
@@ -344,8 +364,15 @@ export async function revealEmailFn(linkedinHref) {
     if (/out of credits|credit limit|upgrade to (view|reveal)/i.test(clean(document.body.innerText))) {
       return { status: 'quota' };
     }
-    const found = readEmails();
-    if (found.length) return { status: 'ok', email: found[0], emails: found };
+    let found = uniq(readEmails());
+    if (found.length) {
+      // A card can carry several addresses and they don't all paint at once —
+      // settle before returning, or the extra ones are silently dropped.
+      await sleep(900);
+      const settled = uniq(readEmails());
+      if (settled.length > found.length) found = settled;
+      return { status: 'ok', email: found[0], emails: found };
+    }
   }
   return { status: 'timeout' };
 }

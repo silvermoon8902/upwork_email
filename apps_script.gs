@@ -19,13 +19,13 @@ const SHEET_NAME = 'Candidates';
 // can be judged by eye against its confidence score; column 3 is the matched
 // ContactOut avatar, which =IMAGE(C2) will render inline in the sheet.
 const HEADER = [
-  'Contactout Full Name | Upwork Full Name', 'Upwork Profile',
+  'Contactout Full Name | Upwork Full Name', 'Country', 'Upwork Profile',
   'Contactout Image URL', 'Email', 'Match Confidence',
   'Job Success', 'Badge', 'Hourly Rate', 'Total Earning',
   'Last Completed', 'Last Hired'
 ];
 
-const EMAIL_COL = 4;   // must match HEADER's 'Email' position -- dedupe reads this column
+const EMAIL_COL = 5;   // must match HEADER's 'Email' position -- dedupe reads this column
 
 function doPost(e) {
   const lock = LockService.getScriptLock();
@@ -60,16 +60,30 @@ function doPost(e) {
       }
     }
 
-    // De-dupe on email, case-insensitively: the same address in different
-    // casing is the same person and must not be contacted twice.
-    const email = String(data.email_address || '').trim();
-    if (email) {
+    // A ContactOut card often lists several addresses (personal + work) and all
+    // of them are kept, comma-separated, in the one Email cell.
+    const emails = (Array.isArray(data.all_emails) && data.all_emails.length
+        ? data.all_emails
+        : [data.email_address])
+      .map(function (e) { return String(e || '').trim().toLowerCase(); })
+      .filter(String)
+      .filter(function (e, i, a) { return a.indexOf(e) === i; });
+
+    // De-dupe case-insensitively, and split existing cells on their separators:
+    // a stored cell can hold several addresses, so an exact whole-cell compare
+    // would miss a person already present under their second address.
+    if (emails.length) {
       const last = sheet.getLastRow();
       if (last > 1) {
-        const seen = sheet.getRange(2, EMAIL_COL, last - 1, 1).getValues()
-          .map(function (row) { return String(row[0]).trim().toLowerCase(); });
-        if (seen.indexOf(email.toLowerCase()) !== -1) {
-          return json({ status: 'duplicate', email: email });
+        const seen = {};
+        sheet.getRange(2, EMAIL_COL, last - 1, 1).getValues().forEach(function (row) {
+          String(row[0]).split(/[,;\s]+/).forEach(function (e) {
+            const t = e.trim().toLowerCase();
+            if (t) seen[t] = true;
+          });
+        });
+        for (var i = 0; i < emails.length; i++) {
+          if (seen[emails[i]]) return json({ status: 'duplicate', email: emails[i] });
         }
       }
     }
@@ -83,9 +97,10 @@ function doPost(e) {
 
     sheet.appendRow([
       names,
+      data.upwork_country        || '',
       data.upwork_profile_link   || '',
       data.contactout_image_url  || '',
-      email,
+      emails.join(', '),
       data.match_confidence      || '',
       data.job_success_score     || '',
       data.badge                 || '',

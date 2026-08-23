@@ -688,12 +688,16 @@ async function coSearchViaTab(cfg, profile) {
   return { all, kept: filterByLastInitial(all, profile.lastInitial), total: out.total };
 }
 
+/** Every address on the card, not just the first — a profile often carries a
+ *  personal and a work address and both are worth having. */
 async function coRevealViaTab(match) {
   const tabId = await ensureContactOutTab();
   const out = await runInTab(tabId, revealEmailFn, match.linkedin);
-  if (!out) return '';
+  if (!out) return [];
   if (out.status === 'quota') throw new PauseRun('ContactOut credits exhausted');
-  return out.status === 'ok' ? out.email : '';
+  if (out.status !== 'ok') return [];
+  const all = (out.emails && out.emails.length) ? out.emails : [out.email];
+  return Array.from(new Set(all.filter(Boolean)));
 }
 
 /* Poll rather than snapshot. Upwork puts a "verifying you are human"
@@ -908,11 +912,12 @@ async function processCandidate(cfg, cand) {
       return true;
     }
 
-    const email = await coRevealViaTab(winner);
-    if (!email) {
+    const emails = await coRevealViaTab(winner);
+    if (!emails.length) {
       await pushLog(`— ${label} → ${winner.fullName}: matched, but no email available.`);
       return true;
     }
+    const email = emails[0];
 
     // Only worth the tab-clicking for candidates actually being saved.
     let activity = { completedEnd: '', hiredStart: '' };
@@ -923,8 +928,10 @@ async function processCandidate(cfg, cand) {
       upwork_name: display,
       upwork_profile_link: cand.profileUrl,
       linkedin_profile_link: winner.linkedin,
-      email_address: email,
+      email_address: email,     // primary, kept for the sink's dedupe key
+      all_emails: emails,
       full_name: winner.fullName,
+      upwork_country: data.country,
       contactout_image_url: winner.avatar || '',
       education: data.education.map(e => e.school).join('; '),
       match_confidence: String(verdict.confidence),
@@ -940,7 +947,7 @@ async function processCandidate(cfg, cand) {
     const ok = await postToSink(cfg.postEndpoint, payload);
     if (ok) S.emails++;
     await pushLog(
-      `✅ ${display} → ${email}  (${winner.fullName}, ${verdict.confidence}% via ${verdict.source})${ok ? '' : '  [POST failed]'}`,
+      `✅ ${display} → ${emails.join(', ')}  (${winner.fullName}, ${verdict.confidence}% via ${verdict.source})${ok ? '' : '  [POST failed]'}`,
       'ok');
     return true;
 
