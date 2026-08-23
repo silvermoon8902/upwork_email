@@ -93,9 +93,39 @@ Upwork is a Vue SPA with hashed `data-v-*` attributes, so the scrapers deliberat
 starts coming back empty on live pages, those two functions are the place to adjust — nothing
 else depends on Upwork's DOM.
 
+Three fields in `scrapeProfile` are scoped deliberately and should not be relaxed back to
+body-text matching:
+
+- **Badge** reads `.vetted-rated-badges`, not the page text. Upwork renders an explainer
+  popover containing "Top Rated Plus talent is highly rated…" on *every* profile, and a
+  freelancer's own overview can name the badges — body-wide matching promotes people who
+  don't hold the badge.
+- **Total earnings** reads `.cfe-ui-profile-summary-stats .col-compact` by matching the
+  caption ("Total earnings" / "Total jobs" / "Total hours"), because the columns share one
+  markup shape and their order isn't guaranteed. The old innerText regex is kept only as a
+  fallback. `statByLabel` also yields Total jobs / Total hours if those are ever wanted.
+- **Title** must exclude `[itemprop="name"]`. A bare `.air3-card-section h2` matches the
+  freelancer's *name* heading, which sits in the same section, so the title silently came
+  back as "Jaclyn B.".
+
+Job success has a second source: the progress ring carries the number in a class
+(`air3-progress-circle-99`), read with `getAttribute('class')` since those are SVG nodes.
+
 `scrapeProfileWithRetry` requires `name` **and** at least one of education/skills before
 accepting a scrape. Keying only on `name` returns on first paint and never gives the
 late-rendering sections a chance.
+
+`scrapeWorkHistoryFn` is separate from `scrapeProfile` and runs **once**, only for candidates
+about to be saved — it clicks tabs and waits, so it must not sit inside the retry loop. It
+reads two dates out of `.work-history-section`: the latest *ended* contract and the latest
+*still-running* one. Two things it depends on:
+
+- **"Completed jobs" and "In progress" are separate tabs rendering separate lists.** Whichever
+  is inactive is not in the DOM at all, so the missing one is clicked and re-read.
+- Entries are classified by the date range itself — a range ending in `Present` is a live
+  contract (take its *start*), anything else is finished (take its *end*). Dates are the max
+  over all visible entries, not the first: the section has a sort toggle, so position is not
+  reliable.
 
 ### Driving the ContactOut dashboard
 

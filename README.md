@@ -57,9 +57,15 @@ skipped rather than guessed.
   "job_success_score":     "100%",
   "badge":                 "Top Rated Plus",
   "hourly_rate":           "$28.50/hr",
-  "total_earning":         "$90K+"
+  "total_earning":         "$90K+",
+  "last_completed_end":    "2026-08-21",
+  "last_hired_start":      "2026-08-21"
 }
 ```
+
+`last_completed_end` is when their most recent contract **ended**; `last_hired_start` is when
+their most recent still-running contract **started** — i.e. when they were last hired. Both are
+ISO dates so the Sheet sorts them correctly.
 
 ## Setup
 

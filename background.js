@@ -218,27 +218,54 @@ function scrapeProfile() {
   if (nameEl) name = clean(nameEl.textContent);
 
   let title = '';
-  const titleEl = document.querySelector('[data-qa="freelancer-title"], h2[data-qa="title"], .air3-card-section h2');
+  // `.air3-card-section h2` on its own matches the *name* heading — it lives in
+  // the same section — so the title has to exclude it.
+  const titleEl = document.querySelector(
+    '[data-qa="freelancer-title"], h2[data-qa="title"], .air3-card-section h2:not([itemprop="name"])');
   if (titleEl) title = clean(titleEl.textContent);
 
   let hourlyRate = '';
   const rm = txt.match(/\$\s?[\d,.]+\s*\/\s*hr/i);
   if (rm) hourlyRate = rm[0].replace(/\s+/g, '');
 
+  // Summary stats pair a .stat-amount with its caption inside each .col-compact.
+  // Read them by label — the columns are not in a guaranteed order.
+  const statByLabel = re => {
+    for (const col of document.querySelectorAll('.cfe-ui-profile-summary-stats .col-compact')) {
+      const amount = col.querySelector('.stat-amount');
+      if (amount && re.test(clean(col.textContent))) return clean(amount.textContent);
+    }
+    return '';
+  };
+  let earning = statByLabel(/total earnings/i);
+  if (!earning) {   // fallback for layouts without the stats card
+    const em = txt.match(/\$\s?[\d,.]+\s*[KMB]?\+?\s*(?:total\s+)?earn/i);
+    if (em) { const mm = em[0].match(/\$\s?[\d,.]+\s*[KMB]?\+?/); if (mm) earning = mm[0].replace(/\s+/g, ''); }
+  }
+
+  // "99% Job Success". The progress ring also encodes it as a class
+  // (air3-progress-circle-99), which survives the label text changing.
   let jss = '';
   const jssEl = document.querySelector('.cfe-ui-profile-job-success');
-  let m = jssEl && jssEl.textContent.match(/(\d+)\s*%/);
-  if (!m) m = txt.match(/(\d+)\s*%\s*Job Success/i);
+  let m = jssEl && clean(jssEl.textContent).match(/(\d+)\s*%/);
+  if (!m && jssEl) {
+    for (const el of jssEl.querySelectorAll('[class]')) {
+      // getAttribute, not .className — these are SVG nodes.
+      const cm = (el.getAttribute('class') || '').match(/air3-progress-circle-(\d+)/);
+      if (cm) { m = [null, cm[1]]; break; }
+    }
+  }
   if (m) jss = m[1] + '%';
 
+  // Scoped to the badge element. The page also carries an explainer popover
+  // reading "Top Rated Plus talent is highly rated…", and a freelancer's own
+  // overview can name the badges, so matching body text false-positives.
   let badge = '';
-  if (/Top Rated Plus/i.test(txt)) badge = 'Top Rated Plus';
-  else if (/Top Rated/i.test(txt)) badge = 'Top Rated';
-  else if (/Rising Talent/i.test(txt)) badge = 'Rising Talent';
-
-  let earning = '';
-  const em = txt.match(/\$\s?[\d,.]+\s*[KMB]?\+?\s*(?:total\s+)?earn/i);
-  if (em) { const mm = em[0].match(/\$\s?[\d,.]+\s*[KMB]?\+?/); if (mm) earning = mm[0].replace(/\s+/g, ''); }
+  const badgeEl = document.querySelector('.vetted-rated-badges .air3-badge-tagline, .vetted-rated-badges');
+  const badgeTxt = badgeEl ? clean(badgeEl.textContent) : '';
+  if (/top rated plus/i.test(badgeTxt)) badge = 'Top Rated Plus';
+  else if (/top rated/i.test(badgeTxt)) badge = 'Top Rated';
+  else if (/rising talent/i.test(badgeTxt)) badge = 'Rising Talent';
 
   let country = '';
   const cEl = document.querySelector('[itemprop="country-name"]');
@@ -281,6 +308,79 @@ function scrapeProfile() {
     blocked: false, name, title, country, hourlyRate, jss, badge, earning,
     education, skills: skills.slice(0, 15), hasGithub, url: location.href
   };
+}
+
+/* Injected: the two "recent activity" dates out of the work-history section —
+ * when the freelancer last finished a contract, and when they were last hired.
+ *
+ * "Completed jobs" and "In progress" are separate tabs rendering separate
+ * lists, so whichever one is inactive is not in the DOM at all and has to be
+ * clicked before it can be read. Dates are taken as the max over every visible
+ * entry rather than the first one, because the section has a sort toggle and
+ * position can't be trusted. */
+async function scrapeWorkHistoryFn() {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+
+  const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+                   jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+  const toIso = (mon, day, year) => {
+    const m = MONTHS[(mon || '').slice(0, 3).toLowerCase()];
+    return m ? `${year}-${String(m).padStart(2, '0')}-${String(day).padStart(2, '0')}` : '';
+  };
+
+  // "Aug 5, 2026 - Aug 21, 2026"  |  "Aug 21, 2026 - Present"
+  const RANGE = /([A-Z][a-z]{2,8})\s+(\d{1,2}),\s*(\d{4})\s*[-–]\s*(?:([A-Z][a-z]{2,8})\s+(\d{1,2}),\s*(\d{4})|Present)/g;
+
+  const section = document.querySelector('.work-history-section, .work-history')
+    || Array.from(document.querySelectorAll('section'))
+        .find(s => /work history/i.test(clean(s.textContent).slice(0, 200)));
+  if (!section) return { completedEnd: '', hiredStart: '' };
+
+  let completedEnd = '', hiredStart = '';
+
+  const harvest = () => {
+    const text = section.innerText || '';
+    RANGE.lastIndex = 0;
+    let m;
+    while ((m = RANGE.exec(text)) !== null) {
+      if (m[4]) {
+        const iso = toIso(m[4], m[5], m[6]);   // has an end date -> contract finished
+        if (iso > completedEnd) completedEnd = iso;
+      } else {
+        const iso = toIso(m[1], m[2], m[3]);   // "- Present" -> still running, so this is the hire date
+        if (iso > hiredStart) hiredStart = iso;
+      }
+    }
+  };
+
+  harvest();
+
+  // Deepest element whose text is just the tab label; the click bubbles to
+  // whichever ancestor Vue bound the handler to.
+  const tabFor = re => {
+    const hits = Array.from(section.querySelectorAll('button, a, [role="tab"], li, div, span'))
+      .filter(el => { const t = clean(el.textContent); return re.test(t) && t.length < 40; });
+    return hits[hits.length - 1] || null;
+  };
+
+  const pending = [
+    [/^completed jobs/i, () => completedEnd],
+    [/^in progress/i, () => hiredStart],
+  ];
+  for (const [re, value] of pending) {
+    if (value()) continue;                     // that tab was already the open one
+    const tab = tabFor(re);
+    if (!tab) continue;
+    tab.click();
+    for (let i = 0; i < 12; i++) {
+      await sleep(400);
+      harvest();
+      if (value()) break;
+    }
+  }
+
+  return { completedEnd, hiredStart };
 }
 
 // Injected: scroll the page down then back up to mimic a real user before scraping.
@@ -561,6 +661,11 @@ async function processCandidate(cfg, cand) {
       return true;
     }
 
+    // Only worth the tab-clicking for candidates actually being saved.
+    let activity = { completedEnd: '', hiredStart: '' };
+    try { activity = (await runInTab(tabId, scrapeWorkHistoryFn)) || activity; }
+    catch (e) { await pushLog(`  work history unreadable for ${label}: ${e}`, 'warn'); }
+
     const payload = {
       upwork_name: display,
       upwork_profile_link: cand.profileUrl,
@@ -574,7 +679,9 @@ async function processCandidate(cfg, cand) {
       job_success_score: data.jss,
       badge: data.badge,
       hourly_rate: data.hourlyRate,
-      total_earning: data.earning
+      total_earning: data.earning,
+      last_completed_end: activity.completedEnd,   // latest finished contract
+      last_hired_start: activity.hiredStart        // latest still-running contract
     };
     const ok = await postToSink(cfg.postEndpoint, payload);
     if (ok) S.emails++;
