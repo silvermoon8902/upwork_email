@@ -20,12 +20,20 @@ export const CO_SEARCH_URL = 'https://contactout.com/dashboard/search';
 /* The dashboard drives its search off query params — running one by hand lands on
  *   /dashboard/search?nm=Edwin&page=1&school=Full%20Sail%20University
  * so the query can be handed over in the URL instead of typed into react-select.
- * `nm` is the Name field, `school` is School/Degree. */
-export function buildSearchUrl(firstName, school, page) {
+ * `nm` is the Name field, `school` is School/Degree.
+ *
+ * `location` is inferred from the form's hidden <input name="location"> — the
+ * other params match their field names exactly, so it very likely does too, but
+ * it is the one param here not confirmed against a real URL. The search URL is
+ * logged on every query: if `total` doesn't drop when a location is present,
+ * this is the param to check first. */
+export function buildSearchUrl(firstName, opts) {
+  const o = opts || {};
   const u = new URL(CO_SEARCH_URL);
   u.searchParams.set('nm', firstName);
-  u.searchParams.set('page', String(page || 1));
-  if (school) u.searchParams.set('school', school);
+  u.searchParams.set('page', String(o.page || 1));
+  if (o.school) u.searchParams.set('school', o.school);
+  if (o.location) u.searchParams.set('location', o.location);
   return u.toString();
 }
 

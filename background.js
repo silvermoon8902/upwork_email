@@ -37,6 +37,11 @@ const SEARCH_POLL_MS = 2500;
 const SEARCH_MAX_WAIT_MS = 60000;
 const PROFILE_MAX_WAIT_MS = 45000;
 
+// A ContactOut result set larger than this means the filters didn't bite — the
+// page only ever yields 15 rows, so matching against them is a lottery that
+// still costs an OpenAI call per candidate. Skip instead of guessing.
+const MAX_SEARCH_TOTAL = 300;
+
 const DEFAULT_CONFIG = {
   searchUrl: '',
   openaiKey: '',
@@ -404,14 +409,14 @@ async function scrapeWorkHistoryFn() {
   return { completedEnd, hiredStart };
 }
 
-// Injected: scroll the page down then back up to mimic a real user before scraping.
+// Injected: one pass to the bottom and back before scraping — enough to look
+// like a visitor and to force the below-the-fold sections to lay out.
 async function humanScrollFn() {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const steps = 6;
-  const h = () => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-  for (let i = 1; i <= steps; i++) { window.scrollTo(0, (h() / steps) * i); await sleep(220 + Math.random() * 380); }
-  await sleep(400);
-  for (let i = steps; i >= 0; i--) { window.scrollTo(0, (h() / steps) * i); await sleep(180 + Math.random() * 260); }
+  const bottom = () => Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+  window.scrollTo(0, bottom());
+  await sleep(500);
+  window.scrollTo(0, 0);
 }
 
 /* -------------------------------- sink ---------------------------------- */
@@ -474,10 +479,15 @@ async function ensureContactOutTab() {
 
 // One query: hand it over in the URL, and only fall back to driving the form if
 // the dashboard loads that URL without actually running the search.
-async function coSearchOnce(cfg, profile, school) {
+async function coSearchOnce(cfg, profile, filters) {
   const tabId = await ensureContactOutTab();
+  const url = buildSearchUrl(profile.firstName, filters);
 
-  await chrome.tabs.update(tabId, { url: buildSearchUrl(profile.firstName, school) });
+  // Logged in full so a filter that silently fails to narrow is visible, and so
+  // the same query can be pasted into a browser to compare.
+  await pushLog(`  query: ${url}`);
+
+  await chrome.tabs.update(tabId, { url });
   await waitForLoad(tabId);
   await sleep(3000);
 
@@ -487,7 +497,7 @@ async function coSearchOnce(cfg, profile, school) {
     await pushLog('  ContactOut ignored the URL query — pressing Search instead.', 'warn');
     const filled = await runInTab(tabId, fillSearchFormFn, {
       firstName: profile.firstName,
-      schools: school ? [school] : [],
+      schools: filters.school ? [filters.school] : [],
     });
     if (!filled || !filled.ok) {
       throw new PauseRun(`ContactOut search could not be submitted (${(filled && filled.error) || 'no result'}) — is the dashboard logged in?`);
@@ -509,23 +519,33 @@ async function coSearchOnce(cfg, profile, school) {
 
 async function coSearchViaTab(cfg, profile) {
   const school = (profile.education[0] || {}).school || '';
+  const location = profile.country || '';
 
-  let out = await coSearchOnce(cfg, profile, school);
+  // Narrowest first. Both filters matter: a first name on its own returns
+  // hundreds of thousands of people, and reading 8 of those is a lottery.
+  let out = await coSearchOnce(cfg, profile, { school, location });
 
   // ContactOut's school taxonomy won't always match Upwork's wording, and a
   // school that matches nothing filters the real person out entirely.
   if (school && out.status === 'empty') {
-    await pushLog(`  no results with school "${school}" — retrying on name alone.`, 'warn');
-    out = await coSearchOnce(cfg, profile, '');
+    await pushLog(`  no results with school "${school}" — retrying on name + location.`, 'warn');
+    out = await coSearchOnce(cfg, profile, { location });
   }
 
-  // ContactOut caps the page at 15; `total` is how many the name really matched.
-  if (out.total > (out.results || []).length) {
-    await pushLog(`  "${profile.firstName}" matched ${out.total} profiles — reading the first ${out.results.length}.`, 'warn');
+  const read = (out.results || []).length;
+  if (out.total > read) {
+    await pushLog(`  "${profile.firstName}" matched ${out.total} profiles — reading the first ${read}.`, 'warn');
+  }
+
+  // Past this point the filters plainly aren't biting. Matching 8 arbitrary
+  // rows out of tens of thousands can't succeed, and every attempt costs an
+  // OpenAI call — so report it as too broad rather than guessing.
+  if (out.total > MAX_SEARCH_TOTAL) {
+    return { all: [], kept: [], tooBroad: true, total: out.total };
   }
 
   const all = normalize(out.results || []);
-  return { all, kept: filterByLastInitial(all, profile.lastInitial) };
+  return { all, kept: filterByLastInitial(all, profile.lastInitial), total: out.total };
 }
 
 async function coRevealViaTab(match) {
@@ -700,7 +720,11 @@ async function processCandidate(cfg, cand) {
       skills: data.skills,
     };
 
-    const { all, kept } = await coSearchViaTab(cfg, profile);
+    const { all, kept, tooBroad, total } = await coSearchViaTab(cfg, profile);
+    if (tooBroad) {
+      await pushLog(`— ${label}: ${total} ContactOut matches for "${firstName}" — too broad to identify, skipped.`, 'warn');
+      return true;
+    }
     if (!all.length) {
       await pushLog(`— ${label}: no ContactOut results for "${firstName}".`);
       return true;

@@ -98,8 +98,11 @@ first 400 characters are logged to the SW console — use that to fix the patter
   elsewhere, and scraping it then reads the wrong page and silently drops the candidate.
 - `waitForLoad` checks `tab.status === 'complete'` *before* registering its `onUpdated`
   listener. Without that check an already-loaded tab waits out the full timeout.
-- `humanScroll` is injected before every scrape to look like a real visitor. Removing it
-  measurably increases captcha frequency.
+- `humanScroll` is injected once after the profile tab loads: jump to the bottom, hold 500ms,
+  jump back to the top, then scrape. Removing it measurably increases captcha frequency. It is
+  a single pass, not a stepped crawl — if `education`/`skills` start coming back empty on
+  profiles that clearly have them, a section that only renders when scrolled into view is the
+  first thing to suspect, and `scrapeProfileWithRetry`'s polling is what covers it.
 
 ### Injected scrapers
 
@@ -162,9 +165,21 @@ its idle pane — `scrapeResultsFn` reports that as `not-searched`, which is del
 from `unknown` (layout changed). Conflating them made a search that never fired look like a
 selector problem.
 
-`coSearchViaTab` retries **without** the school when a school-filtered search returns `empty`:
-ContactOut's school taxonomy doesn't always match Upwork's wording, and a school that matches
-nothing filters out the very person being looked for.
+`coSearchViaTab` sends **`nm` + `school` + `location`** (location from Upwork's
+`country-name`), and retries without the school when that returns `empty`: ContactOut's school
+taxonomy doesn't always match Upwork's wording, and a school that matches nothing filters out
+the very person being looked for.
+
+**The search URL is logged on every query**, because a filter that silently fails to narrow is
+otherwise invisible — a name-only search returns absurd totals ("Jennifer" matched 1,492,077)
+and every one of those still costs an OpenAI call. If `total` doesn't drop when `school` or
+`location` is present, that param is being ignored; paste the logged URL into a browser to
+confirm. `location` in particular is inferred from the form's hidden `<input name="location">`
+and is the one param not confirmed against a real URL.
+
+`MAX_SEARCH_TOTAL` (300) is the backstop: above it the filters plainly aren't biting, the page
+only ever yields 15 rows, and `processCandidate` skips with `tooBroad` rather than paying for a
+match against arbitrary rows.
 
 When the form fallback does run, three things in it are load-bearing:
 
