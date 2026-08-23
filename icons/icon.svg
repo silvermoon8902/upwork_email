@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="Upwork to ContactOut email harvester">
+  <!-- Editable source for the toolbar icon. Chrome cannot load SVG icons, so the
+       PNGs beside this file are generated from it:
+         rsvg-convert -w N -h N icon.svg -o iconN.png     (N = 16, 32, 48, 128)
+       Re-run that after any edit here, or the manifest keeps the old artwork.
+       Green is Upwork's #14a800, matching the running badge in background.js. -->
+  <rect width="128" height="128" rx="28" fill="#14a800"/>
+  <!-- Envelope kept large and high-contrast: the whole thing is 16px wide in the
+       toolbar, and the run badge overlays the lower-right corner. -->
+  <rect x="24" y="37" width="80" height="56" rx="9" fill="#ffffff"/>
+  <path d="M31 46 L64 70 L97 46"
+        fill="none" stroke="#14a800" stroke-width="9"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

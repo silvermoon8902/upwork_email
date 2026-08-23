@@ -116,8 +116,19 @@ The run auto-pauses (rather than burning through the queue) on:
 - a **search page that couldn't be read** — distinct from a genuinely empty page,
   which ends the sweep normally.
 
+## Icon
+
+`icons/icon.svg` is the editable source. Chrome can't load SVG icons, so the PNGs
+beside it are generated and those are what the manifest references. After editing
+the SVG, regenerate them:
+
+```bash
+cd icons && for n in 16 32 48 128; do rsvg-convert -w $n -h $n icon.svg -o icon$n.png; done
+```
+
 ## Files
 - `manifest.json` — MV3 manifest (module service worker)
+- `icons/` — `icon.svg` source plus the generated `icon{16,32,48,128}.png`
 - `background.js` — orchestrator (search walk, profile scrape, matching, POST)
 - `contactout_ui.js` — ContactOut search + email reveal, driven through the dashboard UI
 - `matcher.js` — school-overlap and OpenAI matching
