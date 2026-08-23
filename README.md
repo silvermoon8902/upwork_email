@@ -69,13 +69,18 @@ ISO dates so the Sheet sorts them correctly.
 
 ## Sheet columns
 
-The POST carries every field above; the sink writes ten of them:
+The POST carries every field above; the sink writes eleven of them:
 
-`Full Name` · `Upwork Profile` · `Email` · `Match Confidence` · `Job Success` · `Badge` ·
-`Hourly Rate` · `Total Earning` · `Last Completed` · `Last Hired`
+`Contactout Full Name | Upwork Full Name` · `Upwork Profile` · `Contactout Image URL` ·
+`Email` · `Match Confidence` · `Job Success` · `Badge` · `Hourly Rate` · `Total Earning` ·
+`Last Completed` · `Last Hired`
 
-`upwork_name`, `linkedin_profile_link`, `email_verified`, `education` and `match_source` are
-sent but not written — add them to `HEADER` and `appendRow` in `apps_script.gs` to surface any.
+The first column pairs the two names, and the image URL is the matched ContactOut card's avatar
+— together they let a match be checked by eye against its confidence score. `=IMAGE(C2)` renders
+the avatar inline in the sheet.
+
+`linkedin_profile_link`, `email_verified`, `education` and `match_source` are sent but not
+written — add them to `HEADER` and `appendRow` in `apps_script.gs` to surface any.
 
 ## Setup
 

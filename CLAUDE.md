@@ -307,12 +307,16 @@ message text.
 ### Sink contract
 
 `processCandidate` POSTs the **full** scraped record; `apps_script.gs` selects a subset of it
-into columns. Fields currently sent but not written: `upwork_name`, `linkedin_profile_link`,
-`email_verified`, `education`, `match_source`. Surfacing one is an Apps-Script-only change —
-add it to `HEADER` *and* `appendRow` in the same position.
+into columns. Fields currently sent but not written: `linkedin_profile_link`, `email_verified`,
+`education`, `match_source`. Surfacing one is an Apps-Script-only change — add it to `HEADER`
+*and* `appendRow` in the same position.
+
+Column 1 is `full_name` **joined to** `upwork_name` (`"Zaid Siddiqui | Zaid S."`) so a match can
+be judged by eye against its confidence score, and column 3 is the matched card's ContactOut
+avatar URL (`=IMAGE(C2)` renders it inline). Both exist for manual verification of the matcher.
 
 `HEADER` and `appendRow` are positionally coupled to each other, and **`EMAIL_COL` must track
-the `Email` column's 1-based index** (currently 3) — the dedupe reads that column. Any change
+the `Email` column's 1-based index** (currently 4) — the dedupe reads that column. Any change
 here means re-deploying the Apps Script *and* renaming the old sheet: the sink refuses to append
 when an existing header doesn't match, rather than writing misaligned rows.
 

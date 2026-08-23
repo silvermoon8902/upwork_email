@@ -925,6 +925,7 @@ async function processCandidate(cfg, cand) {
       linkedin_profile_link: winner.linkedin,
       email_address: email,
       full_name: winner.fullName,
+      contactout_image_url: winner.avatar || '',
       education: data.education.map(e => e.school).join('; '),
       match_confidence: String(verdict.confidence),
       match_source: verdict.source,

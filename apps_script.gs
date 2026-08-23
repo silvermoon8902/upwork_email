@@ -10,17 +10,22 @@
 
 const SHEET_NAME = 'Candidates';
 
-// The POST body carries more fields than this (Upwork name, LinkedIn profile,
-// education, match source, email-verified flag). The sink deliberately selects
-// a subset -- to surface one of the others, add it here and to appendRow below,
-// bump EMAIL_COL if the Email position moves, then rename the sheet.
+// The POST body carries more fields than this (LinkedIn profile, education,
+// match source, email-verified flag). The sink deliberately selects a subset --
+// to surface one of the others, add it here and to appendRow below, bump
+// EMAIL_COL if the Email position moves, then rename the sheet.
+//
+// Column 1 joins ContactOut's full name to Upwork's truncated one so a match
+// can be judged by eye against its confidence score; column 3 is the matched
+// ContactOut avatar, which =IMAGE(C2) will render inline in the sheet.
 const HEADER = [
-  'Full Name', 'Upwork Profile', 'Email', 'Match Confidence',
+  'Contactout Full Name | Upwork Full Name', 'Upwork Profile',
+  'Contactout Image URL', 'Email', 'Match Confidence',
   'Job Success', 'Badge', 'Hourly Rate', 'Total Earning',
   'Last Completed', 'Last Hired'
 ];
 
-const EMAIL_COL = 3;   // must match HEADER's 'Email' position -- dedupe reads this column
+const EMAIL_COL = 4;   // must match HEADER's 'Email' position -- dedupe reads this column
 
 function doPost(e) {
   const lock = LockService.getScriptLock();
@@ -69,9 +74,17 @@ function doPost(e) {
       }
     }
 
+    // Both names in one cell so a match can be eyeballed against its confidence
+    // score. ContactOut's first, since that is the identity being asserted.
+    const names = [data.full_name, data.upwork_name]
+      .map(function (n) { return String(n || '').trim(); })
+      .filter(String)
+      .join(' | ');
+
     sheet.appendRow([
-      data.full_name             || '',
+      names,
       data.upwork_profile_link   || '',
+      data.contactout_image_url  || '',
       email,
       data.match_confidence      || '',
       data.job_success_score     || '',
