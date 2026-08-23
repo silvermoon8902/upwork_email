@@ -67,6 +67,16 @@ skipped rather than guessed.
 their most recent still-running contract **started** — i.e. when they were last hired. Both are
 ISO dates so the Sheet sorts them correctly.
 
+## Sheet columns
+
+The POST carries every field above; the sink writes ten of them:
+
+`Full Name` · `Upwork Profile` · `Email` · `Match Confidence` · `Job Success` · `Badge` ·
+`Hourly Rate` · `Total Earning` · `Last Completed` · `Last Hired`
+
+`upwork_name`, `linkedin_profile_link`, `email_verified`, `education` and `match_source` are
+sent but not written — add them to `HEADER` and `appendRow` in `apps_script.gs` to surface any.
+
 ## Setup
 
 ### 1. Google Sheet sink

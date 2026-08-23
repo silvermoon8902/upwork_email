@@ -30,6 +30,13 @@ const STORE = { config: 'hv_config', state: 'hv_state', log: 'hv_log' };
 // Candidates located in these countries are skipped (lowercased match on country-name).
 const SKIP_COUNTRIES = ['india', 'pakistan'];
 
+// Upwork's "verifying you are human" interstitial normally clears on its own,
+// so both scrapes re-read until content appears instead of giving up on the
+// first look. Only after these windows expire is it treated as stuck.
+const SEARCH_POLL_MS = 2500;
+const SEARCH_MAX_WAIT_MS = 60000;
+const PROFILE_MAX_WAIT_MS = 45000;
+
 const DEFAULT_CONFIG = {
   searchUrl: '',
   openaiKey: '',
@@ -174,10 +181,11 @@ async function humanScroll(tabId) {
 /* These run in the page context (serialized by executeScript) — keep them
  * fully self-contained, no references to outer scope. */
 
+/* Returns a status, not a bare list: `pending` (nothing rendered yet) must stay
+ * distinct from `empty` (Upwork says there are genuinely no results), or a page
+ * that is still loading behind an interstitial ends the sweep as a success. */
 function scrapeSearchPage() {
   const txt = document.body ? document.body.innerText : '';
-  const blocked = /Pardon Our Interruption|Verifying you are human|Just a moment|verify you are human/i.test(txt)
-    || !!document.querySelector('#px-captcha, iframe[src*="captcha"], iframe[title*="challenge"]');
 
   const seen = new Set(), out = [];
   document.querySelectorAll('a[href*="~"]').forEach(a => {
@@ -193,7 +201,20 @@ function scrapeSearchPage() {
     name = (nameEl.textContent || '').replace(/\s+/g, ' ').trim();
     out.push({ id, name, profileUrl: 'https://www.upwork.com/freelancers/' + id });
   });
-  return { blocked, candidates: out, url: location.href };
+
+  // Candidates rendering means whatever was in the way has cleared.
+  if (out.length) return { status: 'ok', candidates: out, url: location.href };
+
+  const captcha = /Pardon Our Interruption|Verifying you are human|Just a moment|verify you are human|checking your browser|review the security of your connection/i.test(txt)
+    || !!document.querySelector('#px-captcha, iframe[src*="captcha"], iframe[title*="challenge"]');
+  if (captcha) return { status: 'blocked', candidates: [], url: location.href };
+
+  // Only an explicit marker ends the sweep. An empty DOM is far more often a
+  // page that hasn't rendered yet than the real end of the results.
+  const noResults = /no results found|we couldn't find any|didn't match any|no freelancers (were )?found|0 freelancers|try adjusting your (search|filters)|broaden your search/i.test(txt);
+  if (noResults) return { status: 'empty', candidates: [], url: location.href };
+
+  return { status: 'pending', candidates: [], url: location.href, sample: txt.slice(0, 400) };
 }
 
 function scrapeProfile() {
@@ -497,40 +518,81 @@ async function coRevealViaTab(match) {
   return out.status === 'ok' ? out.email : '';
 }
 
-// `status` distinguishes a genuinely empty page from a failed scrape — conflating
-// them used to end the sweep early and log it as success.
+/* Poll rather than snapshot. Upwork puts a "verifying you are human"
+ * interstitial in front of the search page that usually clears itself after a
+ * few seconds, and the Vue list renders after that — a single read at a fixed
+ * delay sees an empty DOM and used to end the whole sweep as a success.
+ *
+ * Only `empty` ends the sweep; running out of time yields `blocked` (if an
+ * interstitial was seen, so the user can solve it) or `error` (so the page
+ * stays resumable). */
 async function loadPage(cfg, page) {
   const url = withPage(cfg.searchUrl, page);
   await pushLog(`Loading search page ${page}…`);
 
-  let res;
+  let tabId;
   try {
-    const tabId = await ensureSearchTab(url);
+    tabId = await ensureSearchTab(url);
     await waitForLoad(tabId);
-    await sleep(3500); // SPA settle
-    res = await runInTab(tabId, scrapeSearchPage);
   } catch (e) {
-    await pushLog('Search page injection failed: ' + e, 'error');
+    await pushLog('Search tab failed: ' + e, 'error');
     return { status: 'error', candidates: [] };
   }
 
-  if (!res) return { status: 'error', candidates: [] };
-  if (res.blocked) return { status: 'blocked', candidates: [] };
-  await pushLog(`Page ${page}: found ${res.candidates.length} candidates.`);
-  return { status: res.candidates.length ? 'ok' : 'empty', candidates: res.candidates };
+  await sleep(2500);   // let the first paint happen before the first read
+
+  const deadline = Date.now() + SEARCH_MAX_WAIT_MS;
+  let sawCaptcha = false, last = null;
+
+  while (Date.now() < deadline) {
+    try { last = await runInTab(tabId, scrapeSearchPage); }
+    catch (e) { last = null; }
+
+    if (last && last.status === 'ok') {
+      await pushLog(`Page ${page}: found ${last.candidates.length} candidates.`);
+      return { status: 'ok', candidates: last.candidates };
+    }
+    if (last && last.status === 'empty') {
+      return { status: 'empty', candidates: [] };
+    }
+    if (last && last.status === 'blocked' && !sawCaptcha) {
+      sawCaptcha = true;
+      await pushLog('  interstitial on search page — waiting for it to clear…', 'warn');
+    }
+    await sleep(SEARCH_POLL_MS);
+  }
+
+  if (sawCaptcha) return { status: 'blocked', candidates: [] };
+
+  // Rendered nothing recognisable and never said "no results" — don't guess.
+  await pushLog(`Page ${page}: nothing rendered after ${Math.round(SEARCH_MAX_WAIT_MS / 1000)}s.`, 'error');
+  if (last && last.sample) console.log('[search page sample]', last.sample);
+  return { status: 'error', candidates: [] };
 }
 
-// Retries until the GitHub/linked-accounts block has actually rendered — keying
-// on `name` alone returned on first paint and never gave late sections a chance.
+/* Requires `name` AND a late-rendering section before accepting a scrape —
+ * keying on `name` alone returns on first paint. Also keeps polling through an
+ * interstitial rather than pausing on sight of one: the same self-clearing
+ * challenge that fronts the search page fronts profiles too. */
 async function scrapeProfileWithRetry(tabId) {
-  let last = null;
-  for (let i = 0; i < 4; i++) {
-    last = await runInTab(tabId, scrapeProfile);
-    if (last && last.blocked) return last;
-    if (last && last.name && (last.education.length || last.skills.length)) return last;
-    await sleep(2000);
+  const deadline = Date.now() + PROFILE_MAX_WAIT_MS;
+  let last = null, warned = false;
+
+  while (Date.now() < deadline) {
+    try { last = await runInTab(tabId, scrapeProfile); }
+    catch (e) { last = null; }
+
+    if (last && !last.blocked && last.name
+        && ((last.education || []).length || (last.skills || []).length)) {
+      return last;
+    }
+    if (last && last.blocked && !warned) {
+      warned = true;
+      await pushLog('  interstitial on profile — waiting for it to clear…', 'warn');
+    }
+    await sleep(2500);
   }
-  return last;
+  return last;   // may still be {blocked:true}; the caller pauses and keeps the tab
 }
 
 function captchaPause() {
@@ -714,13 +776,13 @@ async function drive() {
         const res = await loadPage(cfg, S.page);
         if (S.status !== 'running') break;
         if (res.status === 'blocked') {
-          await pushLog('⚠️ CAPTCHA on search page — solve it, then click Resume.', 'warn');
+          await pushLog('⚠️ CAPTCHA on search page did not clear on its own — solve it, then click Resume.', 'warn');
           captchaPause();
           break;
         }
         if (res.status === 'error') {
           // Not the same as an empty page — stay resumable on this page.
-          await pauseForQuota('Search page could not be read');
+          await pauseForQuota(`Search page ${S.page} never rendered`);
           break;
         }
         if (res.status === 'empty') {

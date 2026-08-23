@@ -10,15 +10,17 @@
 
 const SHEET_NAME = 'Candidates';
 
+// The POST body carries more fields than this (Upwork name, LinkedIn profile,
+// education, match source, email-verified flag). The sink deliberately selects
+// a subset -- to surface one of the others, add it here and to appendRow below,
+// bump EMAIL_COL if the Email position moves, then rename the sheet.
 const HEADER = [
-  'Timestamp', 'Upwork Name', 'Upwork Profile', 'LinkedIn Profile',
-  'Email', 'Email Verified', 'Full Name', 'Education',
-  'Match Confidence', 'Match Source',
+  'Full Name', 'Upwork Profile', 'Email', 'Match Confidence',
   'Job Success', 'Badge', 'Hourly Rate', 'Total Earning',
   'Last Completed', 'Last Hired'
 ];
 
-const EMAIL_COL = 5;   // must match HEADER's 'Email' position -- dedupe reads this column
+const EMAIL_COL = 3;   // must match HEADER's 'Email' position -- dedupe reads this column
 
 function doPost(e) {
   const lock = LockService.getScriptLock();
@@ -68,16 +70,10 @@ function doPost(e) {
     }
 
     sheet.appendRow([
-      new Date(),
-      data.upwork_name           || '',
-      data.upwork_profile_link   || '',
-      data.linkedin_profile_link || '',
-      email,
-      data.email_verified        || '',
       data.full_name             || '',
-      data.education             || '',
+      data.upwork_profile_link   || '',
+      email,
       data.match_confidence      || '',
-      data.match_source          || '',
       data.job_success_score     || '',
       data.badge                 || '',
       data.hourly_rate           || '',

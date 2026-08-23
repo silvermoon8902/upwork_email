@@ -63,6 +63,28 @@ Two things in that loop are load-bearing and easy to regress:
   sweep normally; `error` pauses so the page stays resumable. Collapsing those two back into
   "no candidates" makes a transient scrape failure silently end a long run and log it as success.
 
+### Waiting out the interstitial
+
+Upwork fronts both search pages and profiles with a "verifying you are human" challenge that
+**normally clears itself** after a few seconds, and the Vue list renders only after that. Both
+scrapers therefore **poll** (`SEARCH_MAX_WAIT_MS`, `PROFILE_MAX_WAIT_MS`) instead of reading
+once at a fixed delay — a single snapshot sees an empty DOM and reports zero candidates.
+
+`scrapeSearchPage` returns a `status`, and `pending` is deliberately distinct from `empty`:
+
+- `ok` — candidate links found; whatever was in the way has cleared.
+- `blocked` — challenge text or a captcha iframe is present.
+- `empty` — Upwork **explicitly** said there are no results. Only this ends the sweep.
+- `pending` — nothing recognisable yet; keep polling.
+
+Running out of the window yields `blocked` (an interstitial was seen at some point, so the user
+is asked to solve it) or `error` (nothing ever rendered — pause, stay resumable). Never `empty`.
+Treating a bare zero-candidate DOM as `empty` is exactly the bug that ended sweeps at page 1.
+
+The `noResults` patterns in `scrapeSearchPage` are **unverified against a real end-of-results
+page**. If a sweep pauses with "never rendered" instead of finishing cleanly, the last snapshot's
+first 400 characters are logged to the SW console — use that to fix the patterns.
+
 ### Tab choreography (deliberate, easy to break)
 
 - The **search tab** is created inactive once and reused across pages (`ensureSearchTab`).
@@ -194,11 +216,17 @@ message text.
 
 ### Sink contract
 
-The POST body keys in `processCandidate` are positionally coupled to `appendRow` in
-`apps_script.gs`, and the Sheet dedupes on **`EMAIL_COL = 5`**. Changing the payload shape means
-editing the payload, `HEADER`, the `appendRow` order, and `EMAIL_COL` together — and
-re-deploying the Apps Script. The sink refuses to append when an existing sheet's header
-doesn't match, rather than writing misaligned rows.
+`processCandidate` POSTs the **full** scraped record; `apps_script.gs` selects a subset of it
+into columns. Fields currently sent but not written: `upwork_name`, `linkedin_profile_link`,
+`email_verified`, `education`, `match_source`. Surfacing one is an Apps-Script-only change —
+add it to `HEADER` *and* `appendRow` in the same position.
+
+`HEADER` and `appendRow` are positionally coupled to each other, and **`EMAIL_COL` must track
+the `Email` column's 1-based index** (currently 3) — the dedupe reads that column. Any change
+here means re-deploying the Apps Script *and* renaming the old sheet: the sink refuses to append
+when an existing header doesn't match, rather than writing misaligned rows.
+
+There is no Timestamp column — rows carry no record of when they were added.
 
 ### Config plumbing
 
